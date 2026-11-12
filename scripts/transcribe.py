@@ -20,7 +20,7 @@ ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if ROOT_DIR not in sys.path:
     sys.path.insert(0, ROOT_DIR)
 
-from auto_storyboard_slicer import auto_slice_words
+from auto_storyboard_slicer import auto_slice_words, normalize_words_input
 
 
 def ensure_ffmpeg_on_path() -> None:
@@ -131,7 +131,11 @@ def main() -> None:
 
     if os.path.isfile(words_path) and os.path.getsize(words_path) > 10:
         with open(words_path, "r", encoding="utf-8") as f:
-            words = json.load(f)
+            raw_words = json.load(f)
+        words = normalize_words_input(raw_words)
+        if not isinstance(raw_words, list) and words:
+            with open(words_path, "w", encoding="utf-8") as wf:
+                json.dump(words, wf, indent=2, ensure_ascii=False)
         print(f"[Transcribe] Carregado words.json existente ({len(words)} palavras).")
     else:
         words = transcribe_with_faster_whisper(dest_audio, model_size=args.model, lang=args.lang)

@@ -38,7 +38,7 @@ Se **NÃO existir** (primeira vez no computador):
 ## 🛡️ 2. TRAVAS ANTI-ESTOURO DE CONTEXTO (OBRIGATÓRIAS EM VÍDEOS CURTOS OU LONGOS)
 
 Para rodar vídeos de 1 minuto a 1 hora de primeira sem travar o modelo (inclusive via OpenBot / ACP):
-1. **PROIBIDO dar `read_file` em arquivos de áudio** (`.mp3`, `.wav`, `.m4a`) ou cortar prévias de áudio.
+1. **PROIBIDO dar `read_file` em arquivos de áudio** (`.mp3`, `.wav`, `.m4a`, `.aac`, `.ogg`, `.flac`, `.opus`) ou cortar prévias de áudio.
 2. **PROIBIDO dar `read_file` no código-fonte dos scripts** (`pipeline_v3.py`, `asset_catalog.py`, etc.), salvo se um comando retornar `Traceback` real.
 3. **PROIBIDO dar `read_file` em `words.json` bruto** ou abrir dezenas de imagens avulsas na conversa principal. Leia **exclusivamente** o arquivo leve `projects/<nome>/slices.txt`.
 4. **PROIBIDO fazer loop manual de polling** repetido em `manage_task`.
@@ -88,12 +88,13 @@ Formato enxuto de cada item na lista JSON (você **não** escreve `start_ms` nem
 ```powershell
 python scripts/build_storyboard.py "projects/<nome_slug>" --title "<Titulo>"
 ```
-*(Opcional: `--mode pop --universe "<Obra>"` para animes/filmes/séries; `--font-theme <tema>` dentre `editorial_documentary`, `modern_grotesk`, `pop_cinema`, `investigative_press`, `literary_chronicle`, `clean_swiss`).*
+*(Opcional: `--mode pop --universe "<Obra>"` para animes/filmes/séries; `--font-theme <tema>` dentre `editorial_documentary`, `modern_grotesk`, `pop_cinema`, `investigative_press`, `literary_chronicle`, `clean_swiss`; `--variation random` para sortear nova semente estética de molduras, transições e grading).*
 
 ### Passo 4 — Baixar Mídias, Compilar e Validar Pacote Final
 ```powershell
 python pipeline_v3.py run-project "projects/<nome_slug>" > "projects/<nome_slug>/build.log" 2>&1; python validate_any_project.py "projects/<nome_slug>"
 ```
+*(Dica: se o usuário pedir para "regerar a edição com outras molduras/variações", passe `--variation random` no `pipeline_v3.py`.)*
 Entregue ao usuário os caminhos clicáveis da pasta `projects/<nome_slug>/freecut_workspace` e do pacote `.freecut.zip`.
 
 ---
@@ -112,7 +113,7 @@ Entregue ao usuário os caminhos clicáveis da pasta `projects/<nome_slug>/freec
 - **Zero Repetição**: Cada cena deve ter uma `query` exclusiva e ligada apenas ao que é dito naquela cena.
 
 ### Proporção Padrão de Layouts & Pegada Manual (Fundo Base `#000000`)
-1. `full_screen` (~70%): Tela cheia com Ken Burns suave e LUT cinematográfico (`"type": "video"` ou `"image"`).
+1. `full_screen` (~70%): Tela cheia com Ken Burns suave e color grading WebGPU cinematográfico (`"type": "video"` ou `"image"`).
 2. `single_card` (~15% a 20%): Card central sobre `#000000` com **8 molduras artesanais variadas automaticamente** (ou defina `"frame_style"` opcional em `specs.json`: `polaroid_editorial`, `torn_paper_scrapbook`, `analog_film_35mm`, `chamfer_dossier`, `gallery_double_mat`, `offset_stacked_print`, `vintage_archival_stamp`, `cinema_glass_bevel`).
 3. `split_info_slide` (~10%): Divisão card artesanal + tipografia lateral com barra editorial (`"sub": true`).
 4. `text_only` (1 a 3 vezes no vídeo em viradas dramáticas): Tela 100% preta com título de impacto em `"text_only_text"` (2 a 4 palavras, ex: `"O PONTO DE VIRADA"`).

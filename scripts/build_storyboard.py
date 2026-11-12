@@ -47,6 +47,7 @@ def main() -> None:
     parser.add_argument("--mode", default="default", help="default ou pop")
     parser.add_argument("--universe", default="", help="Universo/franquia opcional (ex: One Piece, Harry Potter)")
     parser.add_argument("--font-theme", default="", help="Paleta tipografica opcional (ex: editorial_documentary, pop_cinema, investigative_press)")
+    parser.add_argument("--variation-seed", default="", help="Semente opcional para variar molduras, transicoes e grade")
     args = parser.parse_args()
 
     project_dir = os.path.abspath(args.project_dir)
@@ -154,6 +155,8 @@ def main() -> None:
     }
     if args.font_theme:
         storyboard["font_theme"] = args.font_theme.strip()
+    if args.variation_seed:
+        storyboard["variation_seed"] = args.variation_seed.strip()
 
     out_path = os.path.join(project_dir, "storyboard.json")
     with open(out_path, "w", encoding="utf-8") as f:

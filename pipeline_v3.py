@@ -2,6 +2,7 @@ import os
 import re
 import sys
 import json
+import math
 import uuid
 import time
 import glob
@@ -185,18 +186,26 @@ TRACKS = [
 ]
 
 # ── Env Loader ────────────────────────────────────────────────
+def _ensure_ffmpeg_on_path():
+    if shutil.which("ffmpeg") and shutil.which("ffprobe"):
+        return
+    local_app = os.environ.get("LOCALAPPDATA", "")
+    for pat in [
+        os.path.join(local_app, "Microsoft", "WinGet", "Packages", "Gyan.FFmpeg*", "**", "bin", "ffmpeg.exe"),
+        r"C:\ffmpeg\bin\ffmpeg.exe",
+    ]:
+        matches = glob.glob(pat, recursive=True)
+        if matches:
+            os.environ["PATH"] = os.path.dirname(matches[0]) + os.pathsep + os.environ.get("PATH", "")
+            break
+
+
+_ensure_ffmpeg_on_path()
+
+
 def load_env(project_dir):
     """Loads variables from .env in the project directory, repo root, or cwd, and ensures FFmpeg is on PATH."""
-    if not shutil.which("ffmpeg"):
-        local_app = os.environ.get("LOCALAPPDATA", "")
-        for pat in [
-            os.path.join(local_app, "Microsoft", "WinGet", "Packages", "Gyan.FFmpeg*", "**", "bin", "ffmpeg.exe"),
-            r"C:\ffmpeg\bin\ffmpeg.exe",
-        ]:
-            matches = glob.glob(pat, recursive=True)
-            if matches:
-                os.environ["PATH"] = os.path.dirname(matches[0]) + os.pathsep + os.environ.get("PATH", "")
-                break
+    _ensure_ffmpeg_on_path()
 
     repo_env = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
     for dotenv_path in [os.path.join(project_dir, ".env"), repo_env, ".env"]:
@@ -237,15 +246,82 @@ def compute_sha256(filepath):
 def norm_to_px(norm_x, norm_y):
     return int(norm_x * CANVAS_W), int(norm_y * CANVAS_H)
 
+SUPPORTED_AUDIO_EXTS = (".wav", ".mp3", ".m4a", ".aac", ".ogg", ".flac", ".opus")
+
+
 def detect_mime(path):
     ext = os.path.splitext(path)[1].lower()
     return {
-        '.mp4': 'video/mp4', '.mov': 'video/quicktime',
+        '.mp4': 'video/mp4', '.mov': 'video/quicktime', '.webm': 'video/webm', '.mkv': 'video/x-matroska',
         '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg',
         '.gif': 'image/gif', '.webp': 'image/webp',
-        '.mp3': 'audio/mpeg', '.wav': 'audio/wav',
+        '.mp3': 'audio/mpeg', '.wav': 'audio/wav', '.m4a': 'audio/mp4',
+        '.aac': 'audio/aac', '.ogg': 'audio/ogg', '.flac': 'audio/flac', '.opus': 'audio/opus',
         '.json': 'application/json', '.lottie': 'application/octet-stream'
     }.get(ext, 'application/octet-stream')
+
+
+def find_narration_audio(project_dir):
+    """Finds the primary narration audio file in `project_dir` across all common formats."""
+    candidates = []
+    for ext in SUPPORTED_AUDIO_EXTS:
+        candidates.extend(sorted(glob.glob(os.path.join(project_dir, f"*{ext}"))))
+    if not candidates:
+        return None
+    # Prefer files explicitly named narration/audio/voz if multiple exist
+    for c in candidates:
+        stem = os.path.splitext(os.path.basename(c))[0].lower()
+        if any(k in stem for k in ("narration", "narracao", "audio", "voz", "voice")):
+            return c
+    return candidates[0]
+
+
+def load_words_normalized(words_path):
+    """
+    Loads `words.json` whether formatted as a flat list `[{word, start_ms, end_ms}]`
+    or a Whisper dict `{"words": [...], "segments": [...]}` with float-second `start`/`end`.
+    """
+    if not os.path.exists(words_path):
+        return []
+    try:
+        with open(words_path, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+    except Exception:
+        return []
+
+    raw_list = []
+    if isinstance(raw, list):
+        raw_list = raw
+    elif isinstance(raw, dict):
+        if isinstance(raw.get("words"), list):
+            raw_list = raw["words"]
+        elif isinstance(raw.get("segments"), list):
+            for seg in raw["segments"]:
+                if isinstance(seg, dict) and isinstance(seg.get("words"), list):
+                    raw_list.extend(seg["words"])
+
+    out = []
+    for entry in raw_list:
+        if not isinstance(entry, dict):
+            continue
+        w_txt = str(entry.get("word") or entry.get("text") or "").strip()
+        if not w_txt:
+            continue
+        s_ms = entry.get("start_ms")
+        e_ms = entry.get("end_ms")
+        if s_ms is None and entry.get("start") is not None:
+            try:
+                s_ms = int(round(float(entry["start"]) * 1000.0))
+            except (ValueError, TypeError):
+                s_ms = None
+        if e_ms is None and entry.get("end") is not None:
+            try:
+                e_ms = int(round(float(entry["end"]) * 1000.0))
+            except (ValueError, TypeError):
+                e_ms = None
+        if s_ms is not None and e_ms is not None:
+            out.append({"word": w_txt, "start_ms": int(s_ms), "end_ms": int(e_ms)})
+    return out
 
 def find_matching_lottie(project_dir, query):
     lotties_dir = os.path.join(project_dir, "assets", "lotties")
@@ -301,31 +377,50 @@ def get_video_metadata(video_path):
         cmd = [
             "ffprobe", "-v", "error",
             "-select_streams", "v:0",
-            "-show_entries", "stream=width,height,avg_frame_rate,codec_name,duration:format=duration",
+            "-show_entries", "stream=width,height,avg_frame_rate,r_frame_rate,codec_name,duration:format=duration",
             "-of", "json",
             video_path
         ]
         res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True)
         data = json.loads(res.stdout)
         streams = data.get("streams", [])
-        
+        fmt = data.get("format", {}) or {}
+
         duration = 0.0
         width = CANVAS_W
         height = CANVAS_H
         codec = "unknown"
         fps = FPS
-        
+
+        def _safe_pos_float(val):
+            if val is None or val == "N/A":
+                return 0.0
+            try:
+                f = float(val)
+                return f if f > 0.0 and math.isfinite(f) else 0.0
+            except (ValueError, TypeError):
+                return 0.0
+
         if streams:
             s = streams[0]
-            width = s.get("width", CANVAS_W)
-            height = s.get("height", CANVAS_H)
-            codec = s.get("codec_name", "unknown")
-            duration = float(s.get("duration", 0.0))
-            fr = s.get("avg_frame_rate", "30/1")
-            if "/" in fr:
-                num, den = fr.split("/")
-                if float(den) > 0:
-                    fps = int(round(float(num) / float(den)))
+            width = int(s.get("width") or CANVAS_W)
+            height = int(s.get("height") or CANVAS_H)
+            codec = s.get("codec_name") or "unknown"
+            duration = _safe_pos_float(s.get("duration"))
+            for fr_key in ("avg_frame_rate", "r_frame_rate"):
+                fr = str(s.get(fr_key) or "")
+                if "/" in fr:
+                    num_s, den_s = fr.split("/", 1)
+                    num_f, den_f = _safe_pos_float(num_s), _safe_pos_float(den_s)
+                    if num_f > 0 and den_f > 0:
+                        raw_fps = num_f / den_f
+                        if 1.0 <= raw_fps <= 240.0:
+                            fps = int(round(raw_fps)) if abs(raw_fps - round(raw_fps)) < 0.02 else round(raw_fps * 1000.0) / 1000.0
+                            break
+
+        if duration <= 0.0:
+            duration = _safe_pos_float(fmt.get("duration"))
+
         return {"width": width, "height": height, "duration": duration, "codec": codec, "fps": fps}
     except Exception:
         return {"width": CANVAS_W, "height": CANVAS_H, "duration": 0.0, "codec": "unknown", "fps": FPS}
@@ -1091,6 +1186,12 @@ def apply_blur_background_styling(input_path, output_path, seed=42):
     """Formats full_screen images onto 1920x1080 with subtle cinema polish and varied uncropped framing for non-16:9 photos."""
     return editorial_engine.apply_editorial_fullscreen_framing(input_path, output_path, seed=seed)
 
+def _project_editorial_seed(project_dir, sb_data=None):
+    base = os.path.basename(os.path.abspath(project_dir)) or "freecut_project"
+    var = str((sb_data or {}).get("variation_seed") or "").strip()
+    return f"{base}:{var}" if var else base
+
+
 def process_images_pipeline(project_dir):
     images_dir = os.path.join(project_dir, "media", "images")
     processed_dir = os.path.join(project_dir, "media", "processed")
@@ -1116,11 +1217,14 @@ def process_images_pipeline(project_dir):
         except Exception as e:
             print(f"    [Warning] Erro ao ler storyboard para processamento de imagem: {e}")
 
+    proj_seed = _project_editorial_seed(project_dir, sb_data)
+    sample_narration = " ".join(s.get("narration", "") for s in storyboard_scenes[:12])
     _, palette = editorial_engine.select_project_typography_palette(
-        project_seed=os.path.basename(project_dir),
+        project_seed=proj_seed,
         title=sb_data.get("title", ""),
         mode=sb_data.get("mode", "default"),
         universe=sb_data.get("universe", ""),
+        sample_text=sample_narration,
         explicit_theme=sb_data.get("font_theme", ""),
     )
     accents = palette.get("accents", ["#FBBF24", "#38BDF8", "#FB7185"])
@@ -1143,11 +1247,11 @@ def process_images_pipeline(project_dir):
         scene = None
         for s in storyboard_scenes:
             sid = s.get("id")
-            if filename.startswith(f"{sid}_"):
+            if filename.startswith(f"{sid}_") or stem == sid:
                 scene = s
                 break
 
-        seed_val = int(hashlib.md5(f"{project_dir}_{filename}_{idx_img}".encode("utf-8")).hexdigest()[:8], 16)
+        seed_val = int(hashlib.md5(f"{proj_seed}_{filename}_{idx_img}".encode("utf-8")).hexdigest()[:8], 16)
         rng_img = random.Random(seed_val)
         accent_hex = rng_img.choice(accents)
         frame_style = "fullscreen_editorial"
@@ -1176,9 +1280,9 @@ def process_images_pipeline(project_dir):
 
         try:
             st = os.stat(filepath)
-            cache_sig = f"{layout_style}:{frame_style}:{accent_hex}:{st.st_size}:{int(st.st_mtime)}:v2"
+            cache_sig = f"{layout_style}:{frame_style}:{accent_hex}:{seed_val}:{st.st_size}:{int(st.st_mtime)}:v3"
         except OSError:
-            cache_sig = f"{layout_style}:{frame_style}:{accent_hex}:v2"
+            cache_sig = f"{layout_style}:{frame_style}:{accent_hex}:{seed_val}:v3"
 
         if os.path.exists(out_path) and frame_manifest.get(out_name) == cache_sig:
             continue
@@ -1202,7 +1306,7 @@ def process_images_pipeline(project_dir):
                 bg_color = scene.get("bg_color", scene.get("background_color", "#000000"))
                 out_bg_name = f"{sid}_bg.png"
                 out_bg_path = os.path.join(processed_dir, out_bg_name)
-                bg_sig = f"text_only_bg:{bg_color}:v2"
+                bg_sig = f"text_only_bg:{bg_color}:v3"
                 if not os.path.exists(out_bg_path) or frame_manifest.get(out_bg_name) != bg_sig:
                     print(f"    - Gerando background sólido ({bg_color}) para cena de texto {sid}")
                     img = Image.new("RGB", (CANVAS_W, CANVAS_H), bg_color)
@@ -1216,8 +1320,39 @@ def process_images_pipeline(project_dir):
         pass
     return True
 
+
+def ensure_storyboard_rebuilt(project_dir, variation=None):
+    """
+    Ensures raw storyboards (e.g. created via `scripts/build_storyboard.py`) have
+    `layout_params`, `text_layout`, and `text_overlays` populated before `build`.
+    """
+    storyboard_path = os.path.join(project_dir, "storyboard.json")
+    if not os.path.exists(storyboard_path):
+        return False
+    if variation:
+        return rebuild_storyboard(project_dir, variation=variation)
+    try:
+        with open(storyboard_path, "r", encoding="utf-8") as f:
+            sb = json.load(f)
+        scenes = sb.get("scenes", [])
+        needs_rebuild = False
+        for s in scenes:
+            if "text_layout" not in s or "layout_params" not in s:
+                needs_rebuild = True
+                break
+            if s.get("layout_style") == "text_only" and not s.get("text_overlays"):
+                needs_rebuild = True
+                break
+        if needs_rebuild:
+            print("  [Auto-Rebuild] Storyboard bruto detectado — aplicando layout editorial e chunking de legendas...")
+            return rebuild_storyboard(project_dir)
+    except Exception:
+        return False
+    return True
+
+
 # ── Storyboard Rebuilder ──────────────────────────────────────
-def rebuild_storyboard(project_dir):
+def rebuild_storyboard(project_dir, variation=None):
     """Parses raw storyboard.json and words.json to assign archetypes and build subtitles."""
     storyboard_path = os.path.join(project_dir, "storyboard.json")
     words_path = os.path.join(project_dir, "words.json")
@@ -1228,11 +1363,20 @@ def rebuild_storyboard(project_dir):
         
     with open(storyboard_path, "r", encoding="utf-8") as f:
         storyboard = json.load(f)
-        
-    words = []
-    if os.path.exists(words_path):
-        with open(words_path, "r", encoding="utf-8") as f:
-            words = json.load(f)
+
+    if variation is not None:
+        v_str = str(variation).strip()
+        if v_str.lower() in ("random", "new", "auto"):
+            v_str = uuid.uuid4().hex[:8]
+        storyboard["variation_seed"] = v_str
+        # Clear explicit font_theme only if user asked for a fresh random variation and didn't lock font_theme_locked
+        if not storyboard.get("font_theme_locked"):
+            storyboard.pop("font_theme", None)
+        for sc in storyboard.get("scenes", []):
+            if isinstance(sc.get("layout_params"), dict) and not sc.get("frame_style"):
+                sc["layout_params"].pop("frame_style", None)
+
+    words = load_words_normalized(words_path)
             
     scenes = storyboard.get("scenes", [])
     total_scenes = len(scenes)
@@ -1294,9 +1438,10 @@ def rebuild_storyboard(project_dir):
                     
     new_scenes = []
 
+    proj_seed = _project_editorial_seed(project_dir, storyboard)
     sample_narration = " ".join(s.get("narration", "") for s in scenes[:12])
     palette_key, palette = editorial_engine.select_project_typography_palette(
-        project_seed=os.path.basename(project_dir),
+        project_seed=proj_seed,
         title=storyboard.get("title", ""),
         mode=storyboard.get("mode", "default"),
         universe=storyboard.get("universe", ""),
@@ -1323,8 +1468,8 @@ def rebuild_storyboard(project_dir):
         end_ms = scene["end_ms"]
         narration = scene["narration"]
 
-        # Multi-factor entropy seed combining project name, scene index, sid, and narration hash
-        scene_seed = int(hashlib.md5(f"{os.path.basename(project_dir)}_{idx}_{sid}_{narration}".encode("utf-8")).hexdigest()[:8], 16)
+        # Multi-factor entropy seed combining project seed (+ optional variation_seed), scene index, sid, and narration
+        scene_seed = int(hashlib.md5(f"{proj_seed}_{idx}_{sid}_{narration}".encode("utf-8")).hexdigest()[:8], 16)
         rng = random.Random(scene_seed)
 
         # 1. Resolve registered layouts
@@ -1529,10 +1674,13 @@ def rebuild_storyboard(project_dir):
         existing_overlays = scene.get("text_overlays", [])
         text_only_headline = (scene.get("text_only_text") or scene.get("text_overlay") or "").strip()
 
-        if layout_style == "text_only" and (text_only_headline or len(narration.split()) <= 6):
-            headline = text_only_headline or narration.strip()
+        if layout_style == "text_only":
+            raw_hl = text_only_headline or narration.strip()
+            hl_words = raw_hl.split()
+            if not text_only_headline and len(hl_words) > 10:
+                raw_hl = " ".join(hl_words[:8])
             text_overlays.append({
-                "text": headline.upper(),
+                "text": raw_hl.upper(),
                 "appear_at_ms": start_ms,
                 "duration_ms": max(800, end_ms - start_ms),
                 "fontSize": text_font_size,
@@ -3015,6 +3163,8 @@ def _build_subtitles(project_dir, scene, items, all_keyframes, add_media_fn, fon
         matches = (
             glob.glob(os.path.join(project_dir, "media", "processed", f"{sid}_*.png"))
             + glob.glob(os.path.join(project_dir, "media", "images", f"{sid}_*"))
+            + glob.glob(os.path.join(project_dir, "media", "videos", f"{sid}.*"))
+            + glob.glob(os.path.join(project_dir, "media", "videos", f"{sid}_*"))
         )
         if not matches:
             media_missing = True
@@ -3024,19 +3174,13 @@ def _build_subtitles(project_dir, scene, items, all_keyframes, add_media_fn, fon
 
     if media_missing:
         words_path = os.path.join(project_dir, "words.json")
-        scene_words = []
-        if os.path.exists(words_path):
-            try:
-                with open(words_path, "r", encoding="utf-8") as f:
-                    words = json.load(f)
-                scene_words = [
-                    w for w in words
-                    if w.get("start_ms") is not None and w.get("end_ms") is not None
-                    and w["start_ms"] >= start_ms - 200 and w["start_ms"] < end_ms
-                ]
-                scene_words.sort(key=lambda x: x["start_ms"])
-            except Exception as we:
-                print(f"      [Warning] Error loading words for missing media subtitle: {we}")
+        words = load_words_normalized(words_path)
+        scene_words = [
+            w for w in words
+            if w.get("start_ms") is not None and w.get("end_ms") is not None
+            and w["start_ms"] >= start_ms - 200 and w["start_ms"] < end_ms
+        ]
+        scene_words.sort(key=lambda x: x["start_ms"])
 
         text_overlays = []
         if scene_words:
@@ -3148,7 +3292,12 @@ def _build_subtitles(project_dir, scene, items, all_keyframes, add_media_fn, fon
         o_exit = overlay.get("exit", exit_type)
 
         hl_size = o_font_size + 4 if (is_solid_bg and not is_text_only) else o_font_size
-        box_h = 340 if is_text_only else 210
+        if is_text_only:
+            box_h = 420
+        elif layout_style == "split_info_slide":
+            box_h = 290
+        else:
+            box_h = 245
 
         _append_text_item_with_keyframes(
             items=items,
@@ -3200,16 +3349,19 @@ def _build_scene_items(project_dir, scene, items, all_keyframes, add_media_fn, g
         media = scene.get("media", {})
         source_type = media.get("source_type", "image")
 
-        filename_mp4 = f"{sid}.mp4"
-        filepath_mp4 = os.path.join(project_dir, "media", "videos", filename_mp4)
+        vid_candidates = (
+            [os.path.join(project_dir, "media", "videos", f"{sid}{ext}") for ext in (".mp4", ".webm", ".mov")]
+            + sorted(glob.glob(os.path.join(project_dir, "media", "videos", f"{sid}_*")))
+        )
+        vid_match = next((vp for vp in vid_candidates if os.path.isfile(vp)), None)
         lottie_rel_path = media.get("lottie_path")
 
         if source_type == "lottie" and lottie_rel_path:
             is_lottie = True
             filepath = os.path.join(project_dir, lottie_rel_path)
-        elif source_type == "video" and os.path.exists(filepath_mp4):
+        elif source_type == "video" and vid_match:
             is_video = True
-            filepath = filepath_mp4
+            filepath = vid_match
         else:
             filename_png = f"{sid}_E01.png"
             filepath = os.path.join(project_dir, "media", "processed", filename_png)
@@ -3227,8 +3379,17 @@ def _build_scene_items(project_dir, scene, items, all_keyframes, add_media_fn, g
             if filepath.lower().endswith(".json"):
                 is_lottie = True
         else:
-            print(f"      [Warning] Nenhuma mídia encontrada no disco para a cena {sid}")
-            return
+            vid_fallbacks = (
+                [os.path.join(project_dir, "media", "videos", f"{sid}{ext}") for ext in (".mp4", ".webm", ".mov")]
+                + sorted(glob.glob(os.path.join(project_dir, "media", "videos", f"{sid}_*")))
+            )
+            vid_fb = next((vp for vp in vid_fallbacks if os.path.isfile(vp)), None)
+            if vid_fb:
+                filepath = vid_fb
+                is_video = True
+            else:
+                print(f"      [Warning] Nenhuma mídia encontrada no disco para a cena {sid}")
+                return
 
     media_id = add_media_fn(filepath)
     item_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{sid}_anchor"))
@@ -3835,9 +3996,9 @@ def _build_scene_items(project_dir, scene, items, all_keyframes, add_media_fn, g
                     {"id": get_uid(), "frame": dur_f, "value": end_y, "easing": "linear"},
                 ],
             })
-            settled_rot = raw_card_rotation
+            settled_rot = card_rotation
             intro_rot = round(
-                raw_card_rotation + (2.2 if entrance_dir in ["left", "top"] else -2.2),
+                settled_rot + (2.2 if entrance_dir in ["left", "top"] else -2.2),
                 2,
             )
             kf_props.append({
@@ -3871,24 +4032,23 @@ def _build_scene_items(project_dir, scene, items, all_keyframes, add_media_fn, g
             })
 
 
-def _build_scene_adjustments(project_id, scenes, items, palette=None, explicit_style=""):
+def _build_scene_adjustments(project_id, scenes, items, palette=None, explicit_style="", variation_seed=""):
     if not scenes:
         return
 
     import random as prng
-    rng = prng.Random(f"{project_id}_adjustments")
+    rng = prng.Random(f"{project_id}_{variation_seed}_adjustments")
     palette_eff = palette or editorial_engine.EDITORIAL_FONT_PALETTES["editorial_documentary"]
-    lut_pool = palette_eff.get("lut_presets") or ["kodak-2383-d65", "fuji-3513-d65", "warm-film", "cinematic"]
 
     eligible_indices = [i for i, s in enumerate(scenes) if s.get("layout_style") != "text_only"]
     if not eligible_indices:
         return
 
     num_eligible = len(eligible_indices)
-    pct = rng.uniform(0.28, 0.45)
+    pct = rng.uniform(0.30, 0.48)
     num_effects = max(1, min(num_eligible, int(round(num_eligible * pct))))
     effect_indices = sorted(rng.sample(eligible_indices, num_effects))
-    print(f"  [Color Grading] Aplicando LUT editorial + micro-textura em {num_effects} de {num_eligible} cenas")
+    print(f"  [Color Grading] Aplicando WebGPU film grade + micro-textura em {num_effects} de {num_eligible} cenas")
 
     explicit_norm = (explicit_style or "").strip().lower()
 
@@ -3897,7 +4057,7 @@ def _build_scene_adjustments(project_id, scenes, items, palette=None, explicit_s
         sid = scene["id"]
         start_f = ms_to_frames(scene["start_ms"])
         dur_f = max(2, ms_to_frames(scene["end_ms"] - scene["start_ms"]))
-        rng_scene = prng.Random(f"{sid}_effects_calib")
+        rng_scene = prng.Random(f"{sid}_{variation_seed}_effects_calib")
         effects_list = []
 
         if explicit_norm in ("vhs_leak", "cinematic_retro", "noir_bw"):
@@ -3920,47 +4080,12 @@ def _build_scene_adjustments(project_id, scenes, items, palette=None, explicit_s
                     "enabled": True,
                 })
         else:
-            chosen_lut = rng_scene.choice(lut_pool)
-            lut_intensity = round(rng_scene.uniform(0.26, 0.42), 2)
-            style_label = f"LUT {chosen_lut.upper()}"
-            effects_list.append({
-                "id": str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{sid}_effect_lut")),
-                "effect": {
-                    "type": "color-grading",
-                    "variant": "lut",
-                    "preset": chosen_lut,
-                    "intensity": lut_intensity,
-                },
-                "enabled": True,
-            })
-            effects_list.append({
-                "id": str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{sid}_effect_grain")),
-                "effect": {
-                    "type": "gpu-effect",
-                    "gpuEffectType": "gpu-grain",
-                    "params": {
-                        "amount": round(rng_scene.uniform(0.014, 0.026), 3),
-                        "size": round(rng_scene.uniform(0.8, 1.0), 1),
-                        "speed": 1,
-                    },
-                },
-                "enabled": True,
-            })
-            if scene.get("layout_style") == "full_screen":
-                effects_list.append({
-                    "id": str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{sid}_effect_vignette")),
-                    "effect": {
-                        "type": "gpu-effect",
-                        "gpuEffectType": "gpu-vignette",
-                        "params": {
-                            "amount": round(rng_scene.uniform(0.22, 0.34), 2),
-                            "size": 0.52,
-                            "softness": 0.55,
-                            "roundness": 1,
-                        },
-                    },
-                    "enabled": True,
-                })
+            style_label, effects_list = editorial_engine.build_editorial_grade_effects(
+                sid=sid,
+                palette=palette_eff,
+                layout_style=scene.get("layout_style") or "full_screen",
+                rng=rng_scene,
+            )
 
         adjustment_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{sid}_adjustment"))
         items.append({
@@ -3983,14 +4108,13 @@ def build_freecut_bundle(project_dir):
         print(f"  Erro: storyboard.json não encontrado em: {project_dir}")
         return False
 
+    ensure_storyboard_rebuilt(project_dir)
+
     with open(storyboard_file, "r", encoding="utf-8") as f:
         storyboard = json.load(f)
 
-    words = []
     words_file = os.path.join(project_dir, "words.json")
-    if os.path.exists(words_file):
-        with open(words_file, "r", encoding="utf-8") as f:
-            words = json.load(f)
+    words = load_words_normalized(words_file)
 
     render_hyperframes_subtitles(project_dir, storyboard, words)
 
@@ -4000,20 +4124,21 @@ def build_freecut_bundle(project_dir):
         total_dur_ms = max(s.get("end_ms", 0) for s in scenes)
     title = storyboard.get("title", "freecut-project")
 
-    audio_files = glob.glob(os.path.join(project_dir, "*.mp3")) + glob.glob(os.path.join(project_dir, "*.wav"))
-    if not audio_files:
-        print("  Erro: Nenhum arquivo de áudio (.wav ou .mp3) encontrado na raiz do projeto")
+    audio_file = find_narration_audio(project_dir)
+    if not audio_file:
+        print(f"  Erro: Nenhum arquivo de áudio ({', '.join(SUPPORTED_AUDIO_EXTS)}) encontrado na raiz do projeto")
         return False
-    audio_file = audio_files[0]
     raw_audio_dur = get_audio_duration_ms(audio_file) or total_dur_ms
     audio_dur_ms = min(raw_audio_dur, total_dur_ms) if total_dur_ms > 0 else raw_audio_dur
 
     safe_title = "".join(c if c.isalnum() or c in "_- " else "" for c in title).replace(" ", "_")[:40] or "freecut_project"
     project_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, safe_title))
 
+    proj_seed = _project_editorial_seed(project_dir, storyboard)
+    variation_seed = str(storyboard.get("variation_seed") or "")
     sample_narration = " ".join(s.get("narration", "") for s in scenes[:12])
     palette_key, palette = editorial_engine.select_project_typography_palette(
-        project_seed=project_id,
+        project_seed=proj_seed,
         title=title,
         mode=storyboard.get("mode", "default"),
         universe=storyboard.get("universe", ""),
@@ -4038,7 +4163,8 @@ def build_freecut_bundle(project_dir):
         if media_id in seen_media_ids:
             return media_id
         seen_media_ids.add(media_id)
-        rel_path = f"media/{os.path.basename(filepath)}"
+        safe_fname = editorial_engine.sanitize_workspace_filename(os.path.basename(filepath))
+        rel_path = f"media/{safe_fname}"
         mime = detect_mime(filepath)
 
         w, h = CANVAS_W, CANVAS_H
@@ -4061,7 +4187,16 @@ def build_freecut_bundle(project_dir):
             else:
                 dur_ms = get_audio_duration_ms(filepath)
                 duration = (dur_ms / 1000.0) if dur_ms else 1.0
-            codec = "mp3" if filepath.lower().endswith(".mp3") else "wav"
+            ext_a = os.path.splitext(filepath)[1].lower()
+            codec = {
+                ".mp3": "mp3",
+                ".wav": "pcm",
+                ".m4a": "aac",
+                ".aac": "aac",
+                ".ogg": "opus",
+                ".opus": "opus",
+                ".flac": "flac",
+            }.get(ext_a, "pcm")
             fps = FPS
         else:
             try:
@@ -4073,7 +4208,7 @@ def build_freecut_bundle(project_dir):
         manifest_media.append({
             "originalId": media_id,
             "relativePath": rel_path,
-            "fileName": os.path.basename(filepath),
+            "fileName": safe_fname,
             "fileSize": os.path.getsize(filepath),
             "sha256": sha256,
             "mimeType": mime,
@@ -4098,7 +4233,7 @@ def build_freecut_bundle(project_dir):
         "trackId": "track_audio",
         "from": 0,
         "durationInFrames": audio_dur_f,
-        "label": os.path.basename(audio_file),
+        "label": editorial_engine.sanitize_workspace_filename(os.path.basename(audio_file)),
         "type": "audio",
         "mediaRef": audio_media_id,
         "sourceStart": 0,
@@ -4145,7 +4280,7 @@ def build_freecut_bundle(project_dir):
     anchor_items.sort(key=lambda x: x["from"])
 
     import random as prng
-    rng = prng.Random(project_id)
+    rng = prng.Random(f"{project_id}:{variation_seed}")
     prev_trans_preset = None
 
     for i in range(len(anchor_items) - 1):
@@ -4213,8 +4348,15 @@ def build_freecut_bundle(project_dir):
 
         transitions_list.append(trans)
 
-    # 4. Add LUT color grading + micro-grain adjustment layers
-    _build_scene_adjustments(project_id, scenes, items, palette=palette, explicit_style=explicit_style)
+    # 4. Add native WebGPU color grading + micro-grain adjustment layers
+    _build_scene_adjustments(
+        project_id,
+        scenes,
+        items,
+        palette=palette,
+        explicit_style=explicit_style,
+        variation_seed=variation_seed,
+    )
 
     # 5. Prune unused empty foreground/background tracks so the timeline opens fast and clutter-free
     raw_tracks = (
@@ -4359,19 +4501,29 @@ def build_freecut_bundle(project_dir):
         if src_file and os.path.isfile(src_file):
             shutil.copy2(src_file, dest_file)
         else:
-            for local_path, _ in media_files_to_zip:
-                if os.path.basename(local_path) == entry["fileName"]:
+            for local_path, zip_rel in media_files_to_zip:
+                if os.path.basename(zip_rel) == entry["fileName"]:
                     shutil.copy2(local_path, dest_file)
                     media_id_to_filepath[media_id] = dest_file
                     break
+
+    video_priority_ranges = {}
+    for it in items:
+        if it.get("type") == "video" and it.get("mediaRef"):
+            m_ref = it["mediaRef"]
+            sfps = float(it.get("sourceFps") or FPS)
+            s_st = float(it.get("sourceStart") or 0.0) / sfps
+            s_en = float(it.get("sourceEnd") or it.get("durationInFrames") or 30.0) / sfps
+            video_priority_ranges.setdefault(m_ref, []).append((s_st, max(s_st + 0.1, s_en)))
 
     t0_cache = time.time()
     thumb_map = editorial_engine.prewarm_workspace_media_caches(
         workspace_dir=workspace_dir,
         manifest_media=manifest_media,
         media_id_to_filepath=media_id_to_filepath,
+        video_priority_ranges=video_priority_ranges,
     )
-    print(f"  [FastOpen Cache] Filmstrips 1fps, Waveforms WFORM v1 e Thumbnails pré-gerados em {time.time() - t0_cache:.2f}s")
+    print(f"  [FastOpen Cache] Filmstrips v2 (buildTargetIndices), Waveforms (meta+bins+WFORM v1) e Thumbnails gerados em {time.time() - t0_cache:.2f}s")
 
     for entry in manifest_media:
         media_id = entry["originalId"]
@@ -4444,30 +4596,39 @@ def main():
 
     rebuild_cmd = sub.add_parser("rebuild", help="Aplica os novos arquétipos e legendas fatiadas no storyboard.")
     rebuild_cmd.add_argument("project_dir", help="Caminho para o diretório do projeto.")
+    rebuild_cmd.add_argument("--variation", default=None, help="Semente opcional (ou 'random') para gerar nova variação editorial manual.")
 
     download_cmd = sub.add_parser("download", help="Faz download das mídias das APIs (Pexels/Pixabay) ou scrapers.")
     download_cmd.add_argument("project_dir", help="Caminho para o diretório do projeto.")
 
     build_cmd = sub.add_parser("build", help="Processa imagens com Pillow e compila o bundle .freecut.zip")
     build_cmd.add_argument("project_dir", help="Caminho para o diretório do projeto.")
+    build_cmd.add_argument("--variation", default=None, help="Semente opcional (ou 'random') para gerar nova variação editorial manual.")
 
     run_cmd = sub.add_parser("run-project", help="Executa todo o pipeline de ponta a ponta.")
     run_cmd.add_argument("project_dir", help="Caminho para o diretório do projeto.")
+    run_cmd.add_argument("--variation", default=None, help="Semente opcional (ou 'random') para gerar nova variação editorial manual.")
 
     args = parser.parse_args()
     project_dir = os.path.abspath(args.project_dir)
     load_env(project_dir)
 
     if args.command == "rebuild":
-        rebuild_storyboard(project_dir)
+        if not rebuild_storyboard(project_dir, variation=args.variation):
+            sys.exit(1)
     elif args.command == "download":
-        run_media_downloads(project_dir)
+        if not run_media_downloads(project_dir):
+            sys.exit(1)
     elif args.command == "build":
-        process_images_pipeline(project_dir)
-        build_freecut_bundle(project_dir)
+        if not ensure_storyboard_rebuilt(project_dir, variation=args.variation):
+            sys.exit(1)
+        if not process_images_pipeline(project_dir):
+            sys.exit(1)
+        if not build_freecut_bundle(project_dir):
+            sys.exit(1)
     elif args.command == "run-project":
         print(f"=== Iniciando Pipeline Completo (v3) em: {project_dir} ===")
-        if not rebuild_storyboard(project_dir):
+        if not rebuild_storyboard(project_dir, variation=args.variation):
             sys.exit(1)
         if not run_media_downloads(project_dir):
             sys.exit(1)

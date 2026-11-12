@@ -16,8 +16,24 @@ VALID_TRANSFORM_KEYS = {
     "flipHorizontal", "flipVertical", "opacity", "cornerRadius", "aspectRatioLocked",
 }
 
+VALID_GPU_EFFECT_TYPES = {
+    "gpu-brightness", "gpu-contrast", "gpu-saturation", "gpu-hue-rotate",
+    "gpu-sepia", "gpu-invert", "gpu-grayscale", "gpu-exposure",
+    "gpu-temperature", "gpu-levels", "gpu-color-wheels", "gpu-curves",
+    "gpu-gaussian-blur", "gpu-directional-blur", "gpu-radial-blur",
+    "gpu-mosaic", "gpu-pixelate", "gpu-glitch", "gpu-halftone",
+    "gpu-vignette", "gpu-grain", "gpu-sharpen", "gpu-chromatic-aberration",
+    "gpu-kaleidoscope", "gpu-mirror", "gpu-bulge", "gpu-twirl", "gpu-wave",
+    "gpu-posterize", "gpu-threshold", "gpu-glow", "gpu-edge-detect",
+}
 
-def _validate_wform_bin(bin_path: str) -> tuple[bool, str]:
+DEPRECATED_EFFECT_TYPES = {
+    "color-grading", "css-filter", "glitch", "canvas-effect", "overlay-effect",
+}
+
+
+def _validate_waveform_dir(wf_dir: str) -> tuple[bool, str]:
+    bin_path = os.path.join(wf_dir, "multi-res.bin")
     if not os.path.isfile(bin_path):
         return False, "arquivo multi-res.bin ausente"
     data = open(bin_path, "rb").read()
@@ -43,6 +59,46 @@ def _validate_wform_bin(bin_path: str) -> tuple[bool, str]:
         end_byte = data_offset + sample_count * 4
         if end_byte > len(data):
             return False, f"nivel {idx} estoura tamanho do arquivo ({end_byte} > {len(data)})"
+
+    meta_path = os.path.join(wf_dir, "meta.json")
+    if not os.path.isfile(meta_path):
+        return False, "meta.json (WaveformMeta v2) ausente"
+    try:
+        wf_meta = json.load(open(meta_path, "r", encoding="utf-8"))
+    except Exception as exc:
+        return False, f"meta.json invalido: {exc}"
+
+    if (
+        wf_meta.get("kind") != "meta"
+        or wf_meta.get("sampleRate") != 500
+        or wf_meta.get("binDurationSec") != 30
+        or wf_meta.get("channels") != 1
+        or float(wf_meta.get("duration") or 0) <= 0
+    ):
+        return False, f"WaveformMeta invalido: {wf_meta}"
+
+    bin_count = int(wf_meta.get("binCount") or 0)
+    total_samples = int(wf_meta.get("totalSamples") or 0)
+    if bin_count < 1 or total_samples < 1:
+        return False, f"binCount/totalSamples invalidos: {wf_meta}"
+
+    acc_samples = 0
+    for b_idx in range(bin_count):
+        b_meta_p = os.path.join(wf_dir, f"bin-{b_idx}.meta.json")
+        b_bin_p = os.path.join(wf_dir, f"bin-{b_idx}.bin")
+        if not os.path.isfile(b_meta_p) or not os.path.isfile(b_bin_p):
+            return False, f"bin-{b_idx} (.meta.json/.bin) ausente"
+        b_meta = json.load(open(b_meta_p, "r", encoding="utf-8"))
+        if b_meta.get("kind") != "bin" or b_meta.get("binIndex") != b_idx:
+            return False, f"bin-{b_idx}.meta.json kind/binIndex invalido: {b_meta}"
+        s_cnt = int(b_meta.get("samples") or 0)
+        if s_cnt < 1 or os.path.getsize(b_bin_p) != s_cnt * 4:
+            return False, f"bin-{b_idx} tamanho inconsistente ({os.path.getsize(b_bin_p)} != {s_cnt * 4})"
+        acc_samples += s_cnt
+
+    if acc_samples != total_samples:
+        return False, f"soma de samples nos bins ({acc_samples}) != totalSamples ({total_samples})"
+
     return True, "ok"
 
 
@@ -82,12 +138,24 @@ def validate_project(project_dir: str) -> bool:
 
     storyboard_path = os.path.join(project_dir, "storyboard.json")
     storyboard_scenes = []
+    sb_global_subs = True
     if os.path.exists(storyboard_path):
         with open(storyboard_path, "r", encoding="utf-8") as sf:
-            storyboard_scenes = json.load(sf).get("scenes", [])
+            sb_obj = json.load(sf)
+            storyboard_scenes = sb_obj.get("scenes", [])
+            sb_global_subs = sb_obj.get("subtitles", True)
     scenes_by_id = {s["id"]: s for s in storyboard_scenes}
+    items_by_id = {it.get("id"): it for it in items}
 
-    # Map item ID to settled keyframe position
+    expected_sub_scenes = [
+        s["id"] for s in storyboard_scenes
+        if s.get("layout_style") == "text_only" or (sb_global_subs and s.get("subtitles", True))
+    ]
+    if expected_sub_scenes and not text_items:
+        print(f"[FAIL] Nenhuma legenda gerada na timeline apesar de {len(expected_sub_scenes)} cenas ativas!")
+        return False
+
+    # Map item ID to settled keyframe position & check rotation branch consistency
     item_final_x = {}
     item_final_y = {}
     for kf in keyframes:
@@ -95,6 +163,8 @@ def validate_project(project_dir: str) -> bool:
             print(f"[FAIL] Keyframe group de itemId={kf.get('itemId')} sem animationVersion=2.")
             return False
         item_id = kf.get("itemId")
+        target_item = items_by_id.get(item_id, {})
+        base_tf_rot = (target_item.get("transform") or {}).get("rotation")
         for prop in kf.get("properties", []):
             prop_name = prop.get("property")
             kfs = prop.get("keyframes", [])
@@ -104,13 +174,20 @@ def validate_project(project_dir: str) -> bool:
                     if delta_rot > 45.0:
                         print(f"[FAIL] Giro acidental de {delta_rot:.1f}° detectado em keyframes de rotation ({item_id})!")
                         return False
+                settled_val = float(max(kfs, key=lambda x: x.get("frame", 0))["value"])
+                if base_tf_rot is not None and abs(settled_val - float(base_tf_rot)) > 5.0:
+                    print(
+                        f"[FAIL] Discrepância de ramo angular entre transform.rotation ({base_tf_rot}) "
+                        f"e keyframe final ({settled_val}) em {item_id}!"
+                    )
+                    return False
             if kfs:
                 last_kf = max(kfs, key=lambda x: x.get("frame", 0))
                 if prop_name == "x":
                     item_final_x[item_id] = last_kf.get("value")
                 elif prop_name == "y":
                     item_final_y[item_id] = last_kf.get("value")
-    print("[PASS] Todos os grupos de keyframes possuem animationVersion=2.")
+    print("[PASS] Todos os grupos de keyframes possuem animationVersion=2 e continuidade angular.")
 
     # Check 3: Spatial Coordinates & Zero Card/Text Overlap
     for it in text_items:
@@ -244,6 +321,18 @@ def validate_project(project_dir: str) -> bool:
                 print(f"[FAIL] Item {lbl} tem transform.rotation fora de [0, 360): {rot}")
                 return False
 
+        for eff_wrapper in it.get("effects") or []:
+            eff = eff_wrapper.get("effect") or {}
+            eff_type = eff.get("type")
+            if eff_type in DEPRECATED_EFFECT_TYPES:
+                print(f"[FAIL] Item {lbl} usa efeito legado depreciado '{eff_type}' (ignorado pelo WebGPU v15)!")
+                return False
+            if eff_type == "gpu-effect":
+                gpu_type = eff.get("gpuEffectType")
+                if gpu_type not in VALID_GPU_EFFECT_TYPES:
+                    print(f"[FAIL] Item {lbl} usa gpuEffectType inexistente '{gpu_type}'!")
+                    return False
+
         if it.get("type") == "audio":
             vol = float(it.get("volume", 0))
             if vol > 0.0:
@@ -257,9 +346,9 @@ def validate_project(project_dir: str) -> bool:
             if not isinstance(src_end, int) or not isinstance(src_dur, int) or src_end < 1 or src_dur < src_end:
                 print(f"[FAIL] Áudio/SFX {lbl} não está em unidades inteiras de frames (sourceEnd={src_end}, sourceDuration={src_dur})!")
                 return False
-    print("[PASS] Transforms limpos, áudio/SFX em frames + dB calibrado e tracks enxutas.")
+    print("[PASS] Transforms limpos, shaders WebGPU v15 reais, áudio/SFX em frames + dB calibrado e tracks enxutas.")
 
-    # Check 6: Instant-Load Workspace v2 Caches (Thumbnails, Filmstrips v2, Waveforms WFORM v1)
+    # Check 6: Instant-Load Workspace v2 Caches (Thumbnails, Filmstrips v2, Waveforms meta+bins+WFORM v1)
     ws_marker = os.path.join(workspace_dir, ".freecut-workspace.json")
     ws_index = os.path.join(workspace_dir, "index.json")
     if not os.path.isfile(ws_marker) or not os.path.isfile(ws_index):
@@ -287,8 +376,13 @@ def validate_project(project_dir: str) -> bool:
                 return False
             img_thumbs += 1
         elif mime.startswith("video/"):
+            v_dur = float(meta.get("duration") or 0.0)
+            if v_dur <= 0.0:
+                print(f"[FAIL] Vídeo {meta.get('fileName')} com duration={v_dur} inválida em metadata.json!")
+                return False
             t_jpg = os.path.join(m_dir, "thumbnail.jpg")
-            fs_meta_path = os.path.join(m_dir, "cache", "filmstrip", "meta.json")
+            fs_dir = os.path.join(m_dir, "cache", "filmstrip")
+            fs_meta_path = os.path.join(fs_dir, "meta.json")
             if not os.path.isfile(t_jpg) or not os.path.isfile(fs_meta_path):
                 print(f"[FAIL] Vídeo {meta.get('fileName')} sem thumbnail.jpg ou cache/filmstrip/meta.json!")
                 return False
@@ -297,13 +391,18 @@ def validate_project(project_dir: str) -> bool:
             if fs_meta.get("version") != 2 or not fs_meta.get("isComplete") or fs_meta.get("frameCount", 0) < 1:
                 print(f"[FAIL] cache/filmstrip/meta.json inválido para {meta.get('fileName')}: {fs_meta}")
                 return False
+            req_indices = editorial_engine.compute_freecut_filmstrip_target_indices(v_dur)
+            missing_fs = [idx for idx in req_indices if not os.path.isfile(os.path.join(fs_dir, f"{idx}.jpg"))]
+            if missing_fs:
+                print(f"[FAIL] Filmstrip de {meta.get('fileName')} incompleto para buildTargetIndices (faltam {missing_fs[:8]})!")
+                return False
             if "audioCodec" in meta:
                 print(f"[FAIL] Vídeo B-roll {meta.get('fileName')} expõe audioCodec e causaria decode desnecessário!")
                 return False
             vid_filmstrips += 1
         elif mime.startswith("audio/"):
-            wf_bin = os.path.join(m_dir, "cache", "waveform", "multi-res.bin")
-            ok_wf, msg_wf = _validate_wform_bin(wf_bin)
+            wf_dir = os.path.join(m_dir, "cache", "waveform")
+            ok_wf, msg_wf = _validate_waveform_dir(wf_dir)
             if not ok_wf:
                 print(f"[FAIL] Waveform cache inválido para {meta.get('fileName')}: {msg_wf}")
                 return False
@@ -311,7 +410,8 @@ def validate_project(project_dir: str) -> bool:
 
     print(
         f"[PASS] Caches Instant-Load Workspace v2 verificados: "
-        f"{img_thumbs} image thumbs, {vid_filmstrips} video filmstrips (1fps v2), {aud_waveforms} audio waveforms (WFORM v1)."
+        f"{img_thumbs} image thumbs, {vid_filmstrips} video filmstrips (buildTargetIndices v2), "
+        f"{aud_waveforms} audio waveforms (WaveformMeta v2 + bins + WFORM v1)."
     )
     print(f"\n[SUCCESS] Todos os testes passaram com perfeição para {project_dir}!")
     return True

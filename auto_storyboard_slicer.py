@@ -217,8 +217,50 @@ REDUNDANT_QUALIFIERS: List[str] = [
 # 3. Step 1: Strict Audio & Punctuation-Based Slicing Engine
 # ─────────────────────────────────────────────────────────────────────────────
 
+def normalize_words_input(raw: Any) -> List[Dict[str, Any]]:
+    """
+    Normalizes word-timestamp data whether passed as a flat list `[{word, start_ms, end_ms}]`
+    or a Whisper JSON dict `{"words": [...], "segments": [...]}` with float-second `start`/`end`.
+    """
+    raw_list: List[Any] = []
+    if isinstance(raw, list):
+        raw_list = raw
+    elif isinstance(raw, dict):
+        if isinstance(raw.get("words"), list):
+            raw_list = raw["words"]
+        elif isinstance(raw.get("segments"), list):
+            for seg in raw["segments"]:
+                if isinstance(seg, dict) and isinstance(seg.get("words"), list):
+                    raw_list.extend(seg["words"])
+
+    normalized: List[Dict[str, Any]] = []
+    for item in raw_list:
+        if not isinstance(item, dict):
+            continue
+        token = str(item.get("word") or item.get("text") or "").strip()
+        if not token:
+            continue
+        s_ms = item.get("start_ms")
+        e_ms = item.get("end_ms")
+        if s_ms is None and item.get("start") is not None:
+            try:
+                s_ms = int(round(float(item["start"]) * 1000.0))
+            except (ValueError, TypeError):
+                s_ms = None
+        if e_ms is None and item.get("end") is not None:
+            try:
+                e_ms = int(round(float(item["end"]) * 1000.0))
+            except (ValueError, TypeError):
+                e_ms = None
+        if s_ms is not None and e_ms is not None:
+            s_int = max(0, int(s_ms))
+            e_int = max(s_int + 20, int(e_ms))
+            normalized.append({"word": token, "start_ms": s_int, "end_ms": e_int})
+    return normalized
+
+
 def auto_slice_words(
-    words: List[Dict[str, Any]],
+    words: Any,
     min_duration_ms: int = DEFAULT_MIN_DURATION_MS,
     max_duration_ms: int = DEFAULT_MAX_DURATION_MS,
     hard_max_duration_ms: int = HARD_MAX_DURATION_MS
@@ -233,6 +275,7 @@ def auto_slice_words(
     3. Perfect contiguity with zero gaps: scene[N+1].start_ms == scene[N].end_ms.
     4. Handles composite punctuations, hyphenated words (e.g. 'Grã-Bretanha.'), and acoustic pauses.
     """
+    words = normalize_words_input(words)
     if not words:
         return []
 
@@ -789,6 +832,7 @@ def direct_storyboard(
     Slices words, dynamically directs each scene, applies multi-layer backgrounds,
     synchronized SFX, compliant queries, and validated pacing constraints.
     """
+    words = normalize_words_input(words)
     slices = auto_slice_words(words)
     total_scenes = len(slices)
     scenes: List[Dict[str, Any]] = []
@@ -921,9 +965,10 @@ def generate_directed_storyboard(
         raise FileNotFoundError(f"words.json não encontrado em: {project_dir}")
 
     with open(words_path, "r", encoding="utf-8") as f:
-        words = json.load(f)
+        words = normalize_words_input(json.load(f))
 
-    audio_files = [f for f in os.listdir(project_dir) if f.endswith(".mp3") or f.endswith(".wav")]
+    audio_exts = (".wav", ".mp3", ".m4a", ".aac", ".ogg", ".flac", ".opus")
+    audio_files = sorted(f for f in os.listdir(project_dir) if f.lower().endswith(audio_exts))
     audio_file = audio_files[0] if audio_files else "audio.mp3"
     proj_name = os.path.basename(os.path.abspath(project_dir))
     proj_title = title or proj_name
