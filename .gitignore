@@ -1,0 +1,9 @@
+.env
+.setup_ok
+__pycache__/
+*.pyc
+projects/*
+!projects/.gitkeep
+visual_asset_agent/data/
+*.freecut.zip
+*.log
