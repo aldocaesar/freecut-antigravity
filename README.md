@@ -1,6 +1,12 @@
-# 🎬 FreeCut Auto — Edição Automática por Áudio
+# 🎬 FreeCut Auto — Edição Automática com Pegada Manual (Workspace v2 Instant-Load)
 
-Automação local para transformar qualquer áudio narrado (`.mp3`, `.wav`, `.m4a`) em um projeto editado completo para o **FreeCut** (`freecut_workspace/` + `.freecut.zip`), usando **transcrição local gratuita** (`faster-whisper`), **API gratuita do Pixabay** e scrapers inteligentes.
+Automação local para transformar qualquer áudio narrado (`.mp3`, `.wav`, `.m4a`) em um projeto editado completo para o [**FreeCut**](https://github.com/walterlow/freecut) (`freecut_workspace/` + `.freecut.zip`), usando **transcrição local gratuita** (`faster-whisper`), **API gratuita do Pixabay** e direção visual com estética de edição humana.
+
+### ✨ Destaques desta versão
+- ⚡ **Abertura Instantânea no FreeCut (Workspace v2 + Schema v15)**: Pré-gera `thumbnail.jpg`, filmstrips de vídeo a `1fps` (`cache/filmstrip/` v2) e waveforms binárias multi-resolução (`cache/waveform/multi-res.bin` `WFORM` v1), eliminando o gargalo de decodificação ao abrir a pasta `freecut_workspace` na timeline.
+- 🖼️ **8 Molduras Artesanais Variadas**: Substitui retângulos engessados por Polaroid com fita crepe, papel rasgado de scrapbook, película 35mm perfurada, dossiê chanfrado, paspatur duplo de galeria, print empilhado, selo de arquivo vintage e chanfro de vidro escuro — mais composição editorial para imagens verticais/quadradas em tela cheia.
+- 🔤 **Tipografia Editorial Nativa**: Paletas tipográficas coesas do catálogo nativo do FreeCut (`Inter Tight`, `Space Grotesk`, `Bricolage Grotesque`, `Plus Jakarta Sans`, `Oswald`, `Playfair Display`, `Bebas Neue`...), destaques inline multi-span (`textSpans`), pílulas translúcidas e animações GPU nativas (`textMotion`).
+- 🎞️ **Movimento Físico & Color Grading**: Entradas com física `spring` / `cubic-bezier`, `motionModifiers` analíticos (`float-drift`, `breath-pulse`, `micro-shake` v2) e LUTs cinematográficos (`kodak-2383-d65`, `fuji-3513-d65`, `warm-film`, `teal-orange`).
 
 ---
 

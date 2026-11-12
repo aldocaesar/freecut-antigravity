@@ -46,6 +46,7 @@ def main() -> None:
     parser.add_argument("--title", default="", help="Titulo do projeto")
     parser.add_argument("--mode", default="default", help="default ou pop")
     parser.add_argument("--universe", default="", help="Universo/franquia opcional (ex: One Piece, Harry Potter)")
+    parser.add_argument("--font-theme", default="", help="Paleta tipografica opcional (ex: editorial_documentary, pop_cinema, investigative_press)")
     args = parser.parse_args()
 
     project_dir = os.path.abspath(args.project_dir)
@@ -87,10 +88,30 @@ def main() -> None:
             "id": sid,
             "start_ms": start_ms,
             "end_ms": end_ms,
-            "narration": sp.get("text_only_text") or narration if layout == "text_only" else narration,
+            "narration": narration,
             "layout_style": layout,
             "subtitles": True if layout == "text_only" else subtitles,
         }
+
+        if layout == "text_only":
+            headline = str(sp.get("text_only_text") or "").strip()
+            if not headline:
+                words_clean = [w for w in re.findall(r"[A-Za-zÀ-ÿ0-9]+", narration) if len(w) > 1]
+                headline = " ".join(words_clean[:4]).upper() if words_clean else narration[:32].upper()
+            scene_obj["text_only_text"] = headline
+
+        if sp.get("frame_style"):
+            scene_obj["frame_style"] = str(sp["frame_style"]).strip()
+        if sp.get("camera_motion"):
+            scene_obj["camera_motion"] = str(sp["camera_motion"]).strip()
+        if sp.get("transition"):
+            scene_obj["transition"] = str(sp["transition"]).strip()
+        if "rotation" in sp:
+            scene_obj["rotation"] = sp["rotation"]
+        if sp.get("bg_category"):
+            scene_obj["background"] = {"enabled": True, "category": str(sp["bg_category"]).strip()}
+        elif isinstance(sp.get("background"), dict):
+            scene_obj["background"] = sp["background"]
 
         if layout != "text_only":
             media_in = sp.get("media", {}) if isinstance(sp.get("media"), dict) else {}
@@ -131,6 +152,8 @@ def main() -> None:
         "total_duration_ms": scenes[-1]["end_ms"] if scenes else 0,
         "scenes": scenes,
     }
+    if args.font_theme:
+        storyboard["font_theme"] = args.font_theme.strip()
 
     out_path = os.path.join(project_dir, "storyboard.json")
     with open(out_path, "w", encoding="utf-8") as f:

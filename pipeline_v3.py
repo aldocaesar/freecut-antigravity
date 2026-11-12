@@ -14,8 +14,10 @@ import urllib.request
 import urllib.parse
 import shutil
 import ssl
+import copy
 from PIL import Image, ImageDraw, ImageFilter, ImageOps
 import asset_catalog
+import editorial_engine
 
 
 # ── Global Constants ──────────────────────────────────────────
@@ -148,7 +150,7 @@ TRACKS = [
         "height": 100,
         "locked": False,
         "visible": True,
-        "muted": False,
+        "muted": True,
         "solo": False,
         "order": 9,
         "syncLock": True,
@@ -158,7 +160,7 @@ TRACKS = [
         "id": "track_sfx",
         "name": "Sound Effects",
         "kind": "audio",
-        "height": 80,
+        "height": 100,
         "locked": False,
         "visible": True,
         "muted": False,
@@ -1058,142 +1060,54 @@ def run_media_downloads(project_dir):
         json.dump(storyboard, f, indent=2, ensure_ascii=False)
     return True
 
-# ── Pillow Image Processor (Corners + Shadows) ─────────
-def apply_card_styling(input_path, output_path, border_radius=48):
-    """Applies rounded corners and a soft baked drop shadow to card images."""
+# ── Pillow Image Processor (Handcrafted Editorial Frames + Fullscreen Polish) ─────────
+def apply_card_styling(input_path, output_path, border_radius=48, frame_style="polaroid_editorial", accent_hex="#FBBF24", seed=42):
+    """Applies randomized handcrafted editorial framing (Polaroid, Torn Paper, 35mm Film, Chamfer, Double Mat, Stacked Print, Archival Stamp, Cinema Glass) with true alpha drop shadow."""
+    if editorial_engine.apply_handcrafted_card_frame(
+        input_path,
+        output_path,
+        frame_style=frame_style or "polaroid_editorial",
+        accent_hex=accent_hex or "#FBBF24",
+        seed=seed,
+    ):
+        return True
     try:
         img = Image.open(input_path).convert("RGBA")
         orig_w, orig_h = img.size
         aspect = orig_w / float(orig_h) if orig_h > 0 else 1.0
-        
-        if aspect <= 1.0:
-            target_h = 1024
-            target_w = int(target_h * aspect)
-        else:
-            target_w = 1024
-            target_h = int(target_w / aspect)
-            
-        target_w = max(100, (target_w // 2) * 2)
-        target_h = max(100, (target_h // 2) * 2)
-        
+        target_h = 940 if aspect <= 1.0 else max(160, (int(940 / aspect) // 2) * 2)
+        target_w = max(160, (int(940 * aspect) // 2) * 2) if aspect <= 1.0 else 940
         img = img.resize((target_w, target_h), Image.Resampling.LANCZOS)
-        
-        # Rounded corner mask
         mask = Image.new("L", (target_w, target_h), 0)
-        draw = ImageDraw.Draw(mask)
-        draw.rounded_rectangle((0, 0, target_w, target_h), radius=border_radius, fill=255)
+        ImageDraw.Draw(mask).rounded_rectangle((0, 0, target_w - 1, target_h - 1), radius=border_radius, fill=255)
         img.putalpha(mask)
-        
-        # Bake drop shadow
-        pad = 80
-        shadow_w = target_w + 2 * pad
-        shadow_h = target_h + 2 * pad
-        
-        final_canvas = Image.new("RGBA", (shadow_w, shadow_h), (0, 0, 0, 0))
-        shadow_mask = Image.new("L", (shadow_w, shadow_h), 0)
-        shadow_draw = ImageDraw.Draw(shadow_mask)
-        
-        offset_x, offset_y = 0, 16
-        shadow_draw.rounded_rectangle(
-            (pad + offset_x, pad + offset_y, pad + target_w + offset_x, pad + target_h + offset_y),
-            radius=border_radius,
-            fill=110
-        )
-        shadow_blur = shadow_mask.filter(ImageFilter.GaussianBlur(24))
-        
-        final_canvas.paste((0, 0, 0, 255), (0, 0), mask=shadow_blur)
-        final_canvas.paste(img, (pad, pad), mask=img)
-        final_canvas.save(output_path, "PNG")
+        img.save(output_path, "PNG")
         return True
     except Exception as e:
         print(f"      [Pillow Error] Falha ao formatar card: {os.path.basename(input_path)}: {e}")
         return False
 
-def apply_blur_background_styling(input_path, output_path):
-    """Creates a 1920x1080 canvas. If the image is native 16:9, fits cleanly.
-    If the image is vertical, square, 4:3 or ultrawide, places the ENTIRE image intact in center
-    (never cropped), with a cinematic blurred and darkened background filling the 1920x1080 canvas.
-    """
-    try:
-        img = Image.open(input_path).convert("RGBA")
-        orig_w, orig_h = img.size
-        aspect = orig_w / float(orig_h) if orig_h > 0 else 1.0
-
-        # If already native 16:9 widescreen (within 3% of 1.777), fit directly
-        if 1.72 <= aspect <= 1.84:
-            final_img = ImageOps.fit(img, (CANVAS_W, CANVAS_H), Image.Resampling.LANCZOS)
-            final_img.convert("RGB").save(output_path, "PNG")
-            return True
-
-        # For ALL vertical, square, 4:3, and ultrawide images:
-        # 1. Create blurred + darkened background filling 1920x1080
-        scale_bg = max(CANVAS_W / float(orig_w), CANVAS_H / float(orig_h))
-        bg_w = int(orig_w * scale_bg) + 4
-        bg_h = int(orig_h * scale_bg) + 4
-        bg_resized = img.resize((bg_w, bg_h), Image.Resampling.LANCZOS)
-
-        left = (bg_w - CANVAS_W) // 2
-        top = (bg_h - CANVAS_H) // 2
-        bg_cropped = bg_resized.crop((left, top, left + CANVAS_W, top + CANVAS_H))
-
-        # Cinematic blur + darkening
-        bg_blurred = bg_cropped.filter(ImageFilter.GaussianBlur(40))
-        dark_overlay = Image.new("RGBA", (CANVAS_W, CANVAS_H), (0, 0, 0, 110))
-        bg_composite = Image.alpha_composite(bg_blurred, dark_overlay)
-
-        # 2. Scale foreground image so it is 100% INTACT (NEVER cropped!)
-        # Safe bounds: max_h 980 (out of 1080), max_w 1760 (out of 1920)
-        # Guarantees vertical images leave safe margins so Ken Burns camera zoom never cuts them off!
-        max_fg_w = 1760
-        max_fg_h = 980
-        scale_fg = min(max_fg_w / float(orig_w), max_fg_h / float(orig_h))
-        fg_w = int(orig_w * scale_fg)
-        fg_h = int(orig_h * scale_fg)
-
-        fg_resized = img.resize((fg_w, fg_h), Image.Resampling.LANCZOS)
-
-        # 3. Create soft drop shadow for depth
-        pad = 40
-        shadow_mask = Image.new("L", (fg_w + 2 * pad, fg_h + 2 * pad), 0)
-        s_draw = ImageDraw.Draw(shadow_mask)
-        s_draw.rectangle((pad, pad, pad + fg_w, pad + fg_h), fill=160)
-        shadow_blur = shadow_mask.filter(ImageFilter.GaussianBlur(20))
-
-        shadow_layer = Image.new("RGBA", (fg_w + 2 * pad, fg_h + 2 * pad), (0, 0, 0, 0))
-        shadow_layer.paste((0, 0, 0, 255), (0, 0), mask=shadow_blur)
-
-        # 4. Composite onto canvas
-        canvas = Image.new("RGBA", (CANVAS_W, CANVAS_H), (0, 0, 0, 255))
-        canvas.paste(bg_composite, (0, 0))
-
-        paste_x = (CANVAS_W - fg_w) // 2
-        paste_y = (CANVAS_H - fg_h) // 2
-
-        # Paste shadow with slight vertical offset (+8px) for natural lighting
-        canvas.paste(shadow_layer, (paste_x - pad, paste_y - pad + 8), mask=shadow_layer)
-
-        # Add subtle 1px clean border to foreground image for crisp distinction
-        fg_canvas = fg_resized.copy()
-        fg_draw = ImageDraw.Draw(fg_canvas)
-        fg_draw.rectangle((0, 0, fg_w - 1, fg_h - 1), outline=(255, 255, 255, 60), width=1)
-
-        # Paste foreground
-        canvas.paste(fg_canvas, (paste_x, paste_y), mask=fg_canvas)
-
-        canvas.convert("RGB").save(output_path, "PNG")
-        return True
-    except Exception as e:
-        print(f"      [Blur Background Error] Falha ao aplicar blur de fundo: {os.path.basename(input_path)}: {e}")
-        return False
+def apply_blur_background_styling(input_path, output_path, seed=42):
+    """Formats full_screen images onto 1920x1080 with subtle cinema polish and varied uncropped framing for non-16:9 photos."""
+    return editorial_engine.apply_editorial_fullscreen_framing(input_path, output_path, seed=seed)
 
 def process_images_pipeline(project_dir):
     images_dir = os.path.join(project_dir, "media", "images")
     processed_dir = os.path.join(project_dir, "media", "processed")
     os.makedirs(processed_dir, exist_ok=True)
-    
-    # Load storyboard to determine layout style for each image
+    manifest_cache_path = os.path.join(processed_dir, ".frame_manifest.json")
+    frame_manifest = {}
+    if os.path.exists(manifest_cache_path):
+        try:
+            with open(manifest_cache_path, "r", encoding="utf-8") as mf:
+                frame_manifest = json.load(mf)
+        except Exception:
+            frame_manifest = {}
+
+    # Load storyboard to determine layout style, palette, and per-scene handcrafted frame style
     storyboard_path = os.path.join(project_dir, "storyboard.json")
     storyboard_scenes = []
+    sb_data = {}
     if os.path.exists(storyboard_path):
         try:
             with open(storyboard_path, "r", encoding="utf-8") as f:
@@ -1202,14 +1116,29 @@ def process_images_pipeline(project_dir):
         except Exception as e:
             print(f"    [Warning] Erro ao ler storyboard para processamento de imagem: {e}")
 
+    _, palette = editorial_engine.select_project_typography_palette(
+        project_seed=os.path.basename(project_dir),
+        title=sb_data.get("title", ""),
+        mode=sb_data.get("mode", "default"),
+        universe=sb_data.get("universe", ""),
+        explicit_theme=sb_data.get("font_theme", ""),
+    )
+    accents = palette.get("accents", ["#FBBF24", "#38BDF8", "#FB7185"])
+
     # 1. Process standard images
-    image_files = glob.glob(os.path.join(images_dir, "*.png")) + glob.glob(os.path.join(images_dir, "*.jpg"))
-    for filepath in image_files:
+    image_files = (
+        glob.glob(os.path.join(images_dir, "*.png"))
+        + glob.glob(os.path.join(images_dir, "*.jpg"))
+        + glob.glob(os.path.join(images_dir, "*.jpeg"))
+        + glob.glob(os.path.join(images_dir, "*.webp"))
+    )
+    prev_card_styles = []
+    for idx_img, filepath in enumerate(sorted(set(image_files))):
         filename = os.path.basename(filepath)
-        out_path = os.path.join(processed_dir, filename)
-        if os.path.exists(out_path):
-            continue
-            
+        stem, _ = os.path.splitext(filename)
+        out_name = f"{stem}.png"
+        out_path = os.path.join(processed_dir, out_name)
+
         layout_style = "single_card"
         scene = None
         for s in storyboard_scenes:
@@ -1217,30 +1146,74 @@ def process_images_pipeline(project_dir):
             if filename.startswith(f"{sid}_"):
                 scene = s
                 break
+
+        seed_val = int(hashlib.md5(f"{project_dir}_{filename}_{idx_img}".encode("utf-8")).hexdigest()[:8], 16)
+        rng_img = random.Random(seed_val)
+        accent_hex = rng_img.choice(accents)
+        frame_style = "fullscreen_editorial"
+
         if scene:
             layout_style = scene.get("layout_style", "single_card")
-                
-        if layout_style == "full_screen":
-            print(f"    - Processando Pillow blurred background para: {filename}")
-            apply_blur_background_styling(filepath, out_path)
+            lparams = scene.get("layout_params") or {}
+            if layout_style in ("single_card", "split_info_slide"):
+                explicit_fs = lparams.get("frame_style") or scene.get("frame_style") or ""
+                frame_style = editorial_engine.select_card_frame_style(
+                    narration=scene.get("narration", ""),
+                    query=(scene.get("media") or {}).get("query", ""),
+                    mode=sb_data.get("mode", "default"),
+                    scene_idx=idx_img,
+                    prev_styles=prev_card_styles,
+                    rng=rng_img,
+                    explicit_style=explicit_fs,
+                )
+                prev_card_styles.append(frame_style)
         else:
-            print(f"    - Processando Pillow card styling para: {filename}")
-            apply_card_styling(filepath, out_path)
-        
-    # 2. Generate custom background color images for text_only scenes
-    storyboard_path = os.path.join(project_dir, "storyboard.json")
+            frame_style = editorial_engine.select_card_frame_style(
+                narration="", query=filename, mode="default",
+                scene_idx=idx_img, prev_styles=prev_card_styles, rng=rng_img,
+            )
+            prev_card_styles.append(frame_style)
+
+        try:
+            st = os.stat(filepath)
+            cache_sig = f"{layout_style}:{frame_style}:{accent_hex}:{st.st_size}:{int(st.st_mtime)}:v2"
+        except OSError:
+            cache_sig = f"{layout_style}:{frame_style}:{accent_hex}:v2"
+
+        if os.path.exists(out_path) and frame_manifest.get(out_name) == cache_sig:
+            continue
+
+        if layout_style == "full_screen":
+            print(f"    - Processando enquadramento editorial full_screen para: {filename}")
+            if apply_blur_background_styling(filepath, out_path, seed=seed_val):
+                frame_manifest[out_name] = cache_sig
+        else:
+            print(f"    - Processando moldura artesanal [{frame_style}] para: {filename}")
+            if apply_card_styling(filepath, out_path, frame_style=frame_style, accent_hex=accent_hex, seed=seed_val):
+                frame_manifest[out_name] = cache_sig
+
+    # 2. Generate custom background color images for text_only scenes (default pure #000000)
     if os.path.exists(storyboard_path):
         with open(storyboard_path, "r", encoding="utf-8") as f:
             storyboard = json.load(f)
         for scene in storyboard.get("scenes", []):
             if scene.get("layout_style") == "text_only":
                 sid = scene["id"]
-                bg_color = scene.get("bg_color", scene.get("background_color", "#121212"))
-                out_bg_path = os.path.join(processed_dir, f"{sid}_bg.png")
-                if not os.path.exists(out_bg_path):
+                bg_color = scene.get("bg_color", scene.get("background_color", "#000000"))
+                out_bg_name = f"{sid}_bg.png"
+                out_bg_path = os.path.join(processed_dir, out_bg_name)
+                bg_sig = f"text_only_bg:{bg_color}:v2"
+                if not os.path.exists(out_bg_path) or frame_manifest.get(out_bg_name) != bg_sig:
                     print(f"    - Gerando background sólido ({bg_color}) para cena de texto {sid}")
                     img = Image.new("RGB", (CANVAS_W, CANVAS_H), bg_color)
                     img.save(out_bg_path, "PNG")
+                    frame_manifest[out_bg_name] = bg_sig
+
+    try:
+        with open(manifest_cache_path, "w", encoding="utf-8") as mf:
+            json.dump(frame_manifest, mf, indent=2, ensure_ascii=False)
+    except Exception:
+        pass
     return True
 
 # ── Storyboard Rebuilder ──────────────────────────────────────
@@ -1320,48 +1293,64 @@ def rebuild_storyboard(project_dir):
                     s["layout"] = "single_card"
                     
     new_scenes = []
-    
-    # State tracking for balanced alternation across scenes
+
+    sample_narration = " ".join(s.get("narration", "") for s in scenes[:12])
+    palette_key, palette = editorial_engine.select_project_typography_palette(
+        project_seed=os.path.basename(project_dir),
+        title=storyboard.get("title", ""),
+        mode=storyboard.get("mode", "default"),
+        universe=storyboard.get("universe", ""),
+        sample_text=sample_narration,
+        explicit_theme=storyboard.get("font_theme", ""),
+    )
+    storyboard["font_theme"] = palette_key
+    body_font, body_weight = editorial_engine.sanitize_font_and_weight(
+        palette["body_font"], palette["body_weight"]
+    )
+    disp_font, disp_weight = editorial_engine.sanitize_font_and_weight(
+        palette["display_font"], palette["display_weight"]
+    )
+
+    # State tracking for balanced alternation & frame anti-repetition across scenes
     last_split_side = None
     last_split_type = None
     last_single_card_pos = None
-    
+    prev_card_frame_styles = []
+
     for idx, scene in enumerate(scenes):
         sid = scene["id"]
         start_ms = scene["start_ms"]
         end_ms = scene["end_ms"]
         narration = scene["narration"]
-        
-        # Multi-factor entropy seed combining project path, scene index, sid, and narration hash
-        scene_seed = int(hashlib.md5(f"{project_dir}_{idx}_{sid}_{narration}".encode("utf-8")).hexdigest()[:8], 16)
+
+        # Multi-factor entropy seed combining project name, scene index, sid, and narration hash
+        scene_seed = int(hashlib.md5(f"{os.path.basename(project_dir)}_{idx}_{sid}_{narration}".encode("utf-8")).hexdigest()[:8], 16)
         rng = random.Random(scene_seed)
-        
+
         # 1. Resolve registered layouts
         raw_layout = scene.get("layout_style") or scene.get("layout", "single_card")
         layout_style = raw_layout.lower()
         if layout_style not in ["full_screen", "single_card", "text_only", "split_info_slide"]:
             layout_style = "single_card"
-            
+
         media = scene.get("media", {})
         if not media:
             elements = scene.get("elements", [])
             if elements:
                 media = elements[0]
-                
+
         # If there is no media, force text_only
-        if not media or not media.get("query"):
+        if layout_style != "text_only" and (not media or not media.get("query")):
             layout_style = "text_only"
-            
+
         existing_params = dict(scene.get("layout_params", {})) if isinstance(scene.get("layout_params"), dict) else {}
         layout_params = {}
-        
+
         if layout_style == "single_card":
-            # Split top/bottom: card is at top, text at bottom or vice-versa
             user_text_pos = existing_params.get("text_pos")
             if user_text_pos in ["top", "bottom"]:
                 card_pos = "top" if user_text_pos == "bottom" else "bottom"
             else:
-                # Balanced alternating state machine: alternate between top and bottom
                 if last_single_card_pos == "top":
                     card_pos = "bottom"
                 elif last_single_card_pos == "bottom":
@@ -1369,44 +1358,64 @@ def rebuild_storyboard(project_dir):
                 else:
                     card_pos = rng.choice(["top", "bottom"])
             last_single_card_pos = card_pos
-            
+
             cx_jitter = round(rng.uniform(-0.03, 0.03), 3)
             cy_jitter = round(rng.uniform(-0.02, 0.02), 3)
             card_scale = existing_params.get("scale") or round(rng.uniform(0.72, 0.78), 3)
-            
+            chosen_frame = editorial_engine.select_card_frame_style(
+                narration=narration,
+                query=(media or {}).get("query", ""),
+                mode=storyboard.get("mode", "default"),
+                scene_idx=idx,
+                prev_styles=prev_card_frame_styles,
+                rng=rng,
+                explicit_style=scene.get("frame_style") or existing_params.get("frame_style") or "",
+            )
+            prev_card_frame_styles.append(chosen_frame)
+
             if card_pos == "top":
                 layout_params = {
                     "scale": card_scale,
                     "x": existing_params.get("x", cx_jitter),
                     "y": existing_params.get("y", round(-0.09 + cy_jitter, 3)),
-                    "text_pos": "bottom"
+                    "text_pos": "bottom",
+                    "frame_style": chosen_frame,
                 }
             else:
                 layout_params = {
                     "scale": card_scale,
                     "x": existing_params.get("x", cx_jitter),
                     "y": existing_params.get("y", round(0.09 + cy_jitter, 3)),
-                    "text_pos": "top"
+                    "text_pos": "top",
+                    "frame_style": chosen_frame,
                 }
         elif layout_style == "split_info_slide":
             user_split_type = existing_params.get("split_type")
             user_side = existing_params.get("side")
             user_text_pos = existing_params.get("text_pos")
-            
+
             if user_split_type in ["horizontal", "vertical"]:
                 split_type = user_split_type
             else:
-                # Default to balanced alternation between horizontal and vertical
                 if last_split_type == "horizontal" and rng.random() < 0.35:
                     split_type = "vertical"
                 else:
                     split_type = "horizontal"
             last_split_type = split_type
-            
+
             card_scale = existing_params.get("scale") or round(rng.uniform(0.68, 0.74), 3)
-            
+            chosen_frame = editorial_engine.select_card_frame_style(
+                narration=narration,
+                query=(media or {}).get("query", ""),
+                mode=storyboard.get("mode", "default"),
+                scene_idx=idx,
+                prev_styles=prev_card_frame_styles,
+                rng=rng,
+                explicit_style=scene.get("frame_style") or existing_params.get("frame_style") or "",
+            )
+            prev_card_frame_styles.append(chosen_frame)
+
             if split_type == "horizontal":
-                # Balanced side alternator: strictly alternates left and right
                 if user_side in ["left", "right"]:
                     side = user_side
                 else:
@@ -1417,83 +1426,66 @@ def rebuild_storyboard(project_dir):
                     else:
                         side = rng.choice(["left", "right"])
                 last_split_side = side
-                
+
                 cx_jitter = round(rng.uniform(-0.02, 0.02), 3)
                 cy_jitter = round(rng.uniform(-0.03, 0.03), 3)
                 target_x = round((-0.25 if side == "left" else 0.25) + cx_jitter, 3)
-                
+
                 layout_params = {
                     "split_type": "horizontal",
                     "scale": card_scale,
                     "x": existing_params.get("x", target_x),
                     "y": existing_params.get("y", cy_jitter),
-                    "side": side
+                    "side": side,
+                    "frame_style": chosen_frame,
                 }
-            else: # vertical
+            else:  # vertical
                 if user_text_pos in ["top", "bottom"]:
                     text_pos = user_text_pos
                 else:
                     text_pos = "top" if last_single_card_pos == "bottom" else "bottom"
-                
+
                 cx_jitter = round(rng.uniform(-0.03, 0.03), 3)
                 cy_jitter = round(rng.uniform(-0.02, 0.02), 3)
                 target_y = round((0.09 if text_pos == "top" else -0.09) + cy_jitter, 3)
-                
+
                 layout_params = {
                     "split_type": "vertical",
                     "scale": card_scale,
                     "x": existing_params.get("x", cx_jitter),
                     "y": existing_params.get("y", target_y),
-                    "text_pos": text_pos
+                    "text_pos": text_pos,
+                    "frame_style": chosen_frame,
                 }
         elif layout_style == "full_screen":
             layout_params = {
                 "scale": existing_params.get("scale", 1.0),
                 "x": existing_params.get("x", 0.0),
-                "y": existing_params.get("y", 0.0)
+                "y": existing_params.get("y", 0.0),
             }
-            
-        # 2. Premium background color scheme
-        if layout_style == "text_only":
-            bg_color = "#0B0B0C"
-            text_color = "#FFFFFF"
-        elif layout_style in ["single_card", "split_info_slide"]:
-            bg_color = "#000000"
-            text_color = "#FFFFFF"
-        else: # full_screen
-            bg_color = "#0B0B0C"
-            text_color = "#FFFFFF"
-            
-        scene["background_color"] = bg_color
-        
-        # 3. Text layout & positioning
-        is_arabic = bool(re.search(r"[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF]", narration))
-        is_cyrillic = bool(re.search(r"[\u0400-\u04FF]", narration))
-        if is_arabic:
-            font_choices = ["Rubik", "Cairo", "Tajawal", "Almarai", "Roboto", "Segoe UI"]
-        elif is_cyrillic:
-            font_choices = ["Montserrat", "Inter", "Roboto", "Rubik", "Oswald"]
+
+        # 2. Pure #000000 clean black base unless explicit light bg was requested
+        explicit_bg = scene.get("bg_color") or scene.get("background_color") or ""
+        light_bgs = {"#FAF9F6", "#F5F5F7", "#F9F9FB", "#F4F4F5", "#FAF6F0", "#F5EFEB", "#EDE7E1", "#F6F0E5", "#FFFFFF"}
+        if explicit_bg in light_bgs:
+            bg_color = explicit_bg
+            is_light_bg = True
+            text_color = "#111827"
         else:
-            font_choices = ["Montserrat", "Inter", "Bebas Neue", "Oswald", "Outfit", "Plus Jakarta Sans", "Poppins", "Anton", "Rubik", "Cinzel", "Roboto"]
-        text_font = rng.choice(font_choices)
-        
-        # Check if background is light to prevent yellow or light colors on white/light grey
-        is_light_bg = bg_color in ["#FAF9F6", "#F5F5F7", "#F9F9FB", "#F4F4F5", "#FAF6F0", "#F5EFEB", "#EDE7E1", "#F6F0E5", "#FFFFFF"]
-        
-        # Check if narration contains emphasis keywords
-        narration_lower = narration.lower()
-        if any(w in narration_lower for w in ["urgente", "exclusivo", "grave", "prisão", "denúncia", "operação"]):
-            text_color = "#E53935" if is_light_bg else "#FF5252"
-        elif any(w in narration_lower for w in ["provas", "revelação", "documento", "sigilo", "relatório"]):
-            text_color = "#D97706" if is_light_bg else "#FFD54F"
-        elif any(w in narration_lower for w in ["stf", "tribunal", "ministro", "juiz", "decisão", "governo", "congresso"]):
-            text_color = "#1E3A8A" if is_light_bg else "#64B5F6"
-            
-        text_font_size = rng.randint(64, 76)
-        font_weight = rng.choice(["bold", "black"])
-        
-        # Text alignments & positions
+            bg_color = "#000000"
+            is_light_bg = False
+            text_color = "#FFFFFF"
+
+        scene["background_color"] = bg_color
+
+        # 3. Cohesive Editorial Typography & Positioning
+        if layout_style == "text_only":
+            text_font, font_weight = disp_font, disp_weight
+        else:
+            text_font, font_weight = body_font, body_weight
+
         text_align = "center"
+        use_pill_bg = False
         if layout_style == "text_only":
             text_x = 0.0
             text_y = 0.0
@@ -1503,38 +1495,66 @@ def rebuild_storyboard(project_dir):
             if split_type == "horizontal":
                 text_x = 0.25 if layout_params.get("side") == "left" else -0.25
                 text_y = round(rng.uniform(-0.03, 0.03), 3)
-                text_font_size = rng.randint(64, 72)
+                text_font_size = rng.randint(60, 68)
                 text_align = "left"
-            else: # vertical split
+            else:
                 text_x = 0.0
                 text_pos = layout_params.get("text_pos", "bottom")
                 base_y = -0.34 if text_pos == "top" else 0.34
                 text_y = round(base_y + rng.uniform(-0.02, 0.02), 3)
-                text_font_size = rng.randint(64, 72)
+                text_font_size = rng.randint(60, 68)
                 text_align = "center"
         elif layout_style == "single_card":
             text_x = 0.0
             text_pos = layout_params.get("text_pos", "bottom")
             base_y = 0.34 if text_pos == "bottom" else -0.34
-            text_y = round(base_y + rng.uniform(-0.03, 0.03), 3)
+            text_y = round(base_y + rng.uniform(-0.02, 0.02), 3)
             text_align = "center"
-            text_font_size = rng.randint(64, 74)
-        else: # Full Screen
+            text_font_size = rng.randint(62, 70)
+        else:  # full_screen
             text_x = 0.0
-            base_y = rng.choice([rng.uniform(0.30, 0.36), rng.uniform(-0.36, -0.30)])
-            text_y = round(base_y + rng.uniform(-0.03, 0.03), 3)
-            text_font_size = rng.randint(66, 76)
-            
-        entry_type = rng.choice(["typewriter", "cascade", "pop", "blur", "rise", "drop", "slide_left", "slide_right", "fade_in"])
-        exit_type = rng.choice(["fade_out", "rise", "drop", "slide_left", "slide_right", "pop", "blur"])
-        
-        # 4. Words chunker subtitles - show for all scenes if global_subtitles is True
+            # Weighted ~78% classic cinema lower-third, ~22% upper editorial placement
+            base_y = rng.uniform(0.30, 0.35) if rng.random() < 0.78 else rng.uniform(-0.35, -0.30)
+            text_y = round(base_y + rng.uniform(-0.015, 0.015), 3)
+            text_font_size = rng.randint(62, 72)
+            use_pill_bg = rng.random() < 0.24
+
+        entry_type = rng.choice(["fade-up", "rise", "cascade", "pop", "blur-in", "slide-mask", "typewriter"])
+        exit_type = rng.choice(["fade-down", "sink", "blur-out", "pop-out"])
+
+        # 4. Subtitle chunking (with dedicated full-scene dramatic card for `text_only`)
         global_subtitles = storyboard.get("subtitles", True)
-        show_subtitles = global_subtitles and scene.get("subtitles", True)
+        show_subtitles = (layout_style == "text_only") or (global_subtitles and scene.get("subtitles", True))
         text_overlays = []
         existing_overlays = scene.get("text_overlays", [])
-        if existing_overlays and any(ov.get("text") for ov in existing_overlays):
-            text_overlays = existing_overlays
+        text_only_headline = (scene.get("text_only_text") or scene.get("text_overlay") or "").strip()
+
+        if layout_style == "text_only" and (text_only_headline or len(narration.split()) <= 6):
+            headline = text_only_headline or narration.strip()
+            text_overlays.append({
+                "text": headline.upper(),
+                "appear_at_ms": start_ms,
+                "duration_ms": max(800, end_ms - start_ms),
+                "fontSize": text_font_size,
+                "fontFamily": disp_font,
+                "fontWeight": disp_weight,
+                "x": 0.0,
+                "y": 0.0,
+                "entry": rng.choice(["rise", "blur-in", "slide-mask", "cascade"]),
+                "exit": "fade-down",
+            })
+        elif existing_overlays and (not words or scene.get("custom_overlays")):
+            for ov in existing_overlays:
+                if not ov.get("text"):
+                    continue
+                ov_copy = dict(ov)
+                fam_s, w_s = editorial_engine.sanitize_font_and_weight(
+                    ov_copy.get("fontFamily", body_font),
+                    ov_copy.get("fontWeight", body_weight),
+                )
+                ov_copy["fontFamily"] = fam_s
+                ov_copy["fontWeight"] = w_s
+                text_overlays.append(ov_copy)
         elif show_subtitles:
             scene_words = [
                 w for w in words
@@ -1542,64 +1562,62 @@ def rebuild_storyboard(project_dir):
                 and w["start_ms"] >= start_ms - 200 and w["start_ms"] < end_ms
             ]
             scene_words.sort(key=lambda x: x["start_ms"])
-            
+
             if scene_words:
                 current_chunk = []
                 chunk_start = None
-                chunk_limit = rng.choice([1, 2, 2, 3, 3, 4]) # Randomly 1, 2, 3, or 4 words per chunk
-                
+                chunk_limit = rng.choice([2, 2, 3, 3, 4, 1])
+
                 def _build_chunk_overlay(chunk_words, start_t, end_t):
                     w_count = len(chunk_words)
                     chunk_txt = " ".join(chunk_words)
-                    # Dynamic typography per chunk
                     if w_count == 1:
-                        c_size = rng.randint(84, 98)
-                        c_weight = "black"
-                        c_y = round(text_y + rng.choice([-0.05, 0.0, 0.05]), 3)
+                        c_size = rng.randint(80, 92)
+                        c_font, c_weight = disp_font, disp_weight
+                        c_y = round(text_y + rng.choice([-0.015, 0.0, 0.015]), 3)
+                        c_entry = rng.choice(["pop", "rise", "blur-in", "slide-mask"])
                     elif w_count == 2:
-                        c_size = rng.randint(72, 84)
-                        c_weight = "bold"
-                        c_y = round(text_y + rng.choice([-0.02, 0.0, 0.02]), 3)
+                        c_size = rng.randint(68, 76)
+                        c_font, c_weight = body_font, body_weight
+                        c_y = round(text_y + rng.choice([-0.01, 0.0, 0.01]), 3)
+                        c_entry = rng.choice(["fade-up", "rise", "pop", "blur-in", "cascade"])
                     else:
-                        c_size = rng.randint(62, 72)
-                        c_weight = "bold"
+                        c_size = rng.randint(60, 68)
+                        c_font, c_weight = body_font, body_weight
                         c_y = text_y
-                    
-                    c_font = rng.choice(font_choices) if rng.random() < 0.35 else text_font
-                    c_entry = rng.choice(["pop", "blur", "rise", "typewriter", "fade_in"])
-                    c_exit = rng.choice(["fade_out", "blur", "pop", "drop"])
-                    
+                        c_entry = rng.choice(["fade-up", "rise", "slide-mask", "typewriter", "blur-in"])
+
+                    c_exit = rng.choice(["fade-down", "blur-out", "sink"])
                     return {
                         "text": chunk_txt,
                         "appear_at_ms": start_t,
-                        "duration_ms": max(800, end_t - start_t),
+                        "duration_ms": max(750, end_t - start_t),
                         "fontSize": c_size,
                         "fontFamily": c_font,
                         "fontWeight": c_weight,
                         "x": text_x,
                         "y": c_y,
                         "entry": c_entry,
-                        "exit": c_exit
+                        "exit": c_exit,
                     }
-                    
+
                 for w in scene_words:
                     if not current_chunk:
                         chunk_start = w["start_ms"]
                     current_chunk.append(w["word"])
                     clean_word = w["word"].strip()
                     has_punct = any(p in clean_word for p in [".", ",", "!", "?", ";"])
-                    
+
                     if len(current_chunk) >= chunk_limit or has_punct or (w["end_ms"] - chunk_start > 1900):
                         text_overlays.append(_build_chunk_overlay(current_chunk, chunk_start, w["end_ms"]))
                         current_chunk = []
-                        chunk_limit = rng.choice([1, 2, 2, 3, 3, 4]) # Reset chunk limit randomly
+                        chunk_limit = rng.choice([2, 2, 3, 3, 4, 1])
                 if current_chunk:
                     text_overlays.append(_build_chunk_overlay(current_chunk, chunk_start, end_ms))
             else:
-                # Fallback to single text overlay using narrative
-                text_raw = scene.get("text_overlay") or narration
+                text_raw = scene.get("text_only_text") or scene.get("text_overlay") or narration
                 text_overlays.append({
-                    "text": text_raw,
+                    "text": text_raw.upper() if layout_style == "text_only" else text_raw,
                     "appear_at_ms": start_ms,
                     "duration_ms": end_ms - start_ms,
                     "fontSize": text_font_size,
@@ -1608,16 +1626,29 @@ def rebuild_storyboard(project_dir):
                     "x": text_x,
                     "y": text_y,
                     "entry": entry_type,
-                    "exit": exit_type
+                    "exit": exit_type,
                 })
-            
-            # Enforce sequential (non-overlapping) subtitles
+
             for i in range(len(text_overlays) - 1):
                 curr_overlay = text_overlays[i]
-                next_overlay = text_overlays[i+1]
+                next_overlay = text_overlays[i + 1]
                 if curr_overlay["appear_at_ms"] + curr_overlay["duration_ms"] > next_overlay["appear_at_ms"]:
                     curr_overlay["duration_ms"] = max(100, next_overlay["appear_at_ms"] - curr_overlay["appear_at_ms"])
-            
+
+        text_layout_obj = {
+            "x": text_x,
+            "y": text_y,
+            "fontSize": text_font_size,
+            "color": text_color,
+            "fontFamily": text_font,
+            "fontWeight": font_weight,
+            "textAlign": text_align,
+            "entry": entry_type,
+            "exit": exit_type,
+        }
+        if use_pill_bg and not is_light_bg:
+            text_layout_obj["pill_bg"] = palette.get("pill_bg", "rgba(10, 12, 18, 0.72)")
+
         rebuilt_scene = {
             "id": sid,
             "start_ms": start_ms,
@@ -1628,55 +1659,41 @@ def rebuild_storyboard(project_dir):
             "bg_color": bg_color,
             "transition": scene.get("transition", "crossfade"),
             "subtitles": show_subtitles,
-            "text_layout": {
-                "x": text_x,
-                "y": text_y,
-                "fontSize": text_font_size,
-                "color": text_color,
-                "fontFamily": text_font,
-                "fontWeight": font_weight,
-                "textAlign": text_align,
-                "entry": entry_type,
-                "exit": exit_type
-            },
-            "text_overlays": text_overlays
+            "text_layout": text_layout_obj,
+            "text_overlays": text_overlays,
         }
-        
+
+        if text_only_headline:
+            rebuilt_scene["text_only_text"] = text_only_headline
+        if scene.get("frame_style"):
+            rebuilt_scene["frame_style"] = scene["frame_style"]
         if scene.get("info_card"):
             rebuilt_scene["info_card"] = scene["info_card"]
-            
         if scene.get("sfx"):
             rebuilt_scene["sfx"] = scene["sfx"]
-            
         if scene.get("background"):
             rebuilt_scene["background"] = scene["background"]
-            
         if scene.get("layers"):
             rebuilt_scene["layers"] = scene["layers"]
-            
         if scene.get("cutout"):
             rebuilt_scene["cutout"] = scene["cutout"]
-            
         if scene.get("foreground"):
             rebuilt_scene["foreground"] = scene["foreground"]
-            
         if scene.get("camera_motion"):
             rebuilt_scene["camera_motion"] = scene["camera_motion"]
-            
         if "rotation" in scene:
             rebuilt_scene["rotation"] = scene["rotation"]
-            
         if layout_style != "text_only":
             rebuilt_scene["media"] = media
-            
+
         new_scenes.append(rebuilt_scene)
-        
+
     storyboard["scenes"] = new_scenes
     if new_scenes:
         storyboard["total_duration_ms"] = max(s.get("end_ms", 0) for s in new_scenes)
     with open(storyboard_path, "w", encoding="utf-8") as f:
         json.dump(storyboard, f, indent=2, ensure_ascii=False)
-    print(f"  [OK] Storyboard reconstruído com novos arquétipos em: {storyboard_path}")
+    print(f"  [OK] Storyboard reconstruído com paleta editorial '{palette['name']}' em: {storyboard_path}")
     return True
 
 # ── FreeCut Zip Bundle Compiler ────────────────────────────────
@@ -1936,9 +1953,11 @@ def split_to_chars(text):
     return html
 
 def render_hyperframes_subtitles(project_dir, storyboard, words):
-    """Generates HTML templates and renders WebM transparent kinetic typography overlays for subtitles."""
+    """Generates HTML templates and renders WebM transparent kinetic typography overlays for info_cards."""
     scenes = storyboard.get("scenes", [])
     if not words:
+        return
+    if not any(s.get("info_card") and (s.get("end_ms", 0) - s.get("start_ms", 0)) >= 5000 for s in scenes):
         return
         
     hf_config = {
@@ -2750,157 +2769,110 @@ def render_hyperframes_subtitles(project_dir, storyboard, words):
     #     except Exception:
     #         pass
 
-def _append_text_item_with_keyframes(items, all_keyframes, item_id, track_id, from_f, dur_f, label, text, font_size, font_family, font_weight, color, text_align, pos_x, pos_y, text_width, text_height, entry_type, exit_type, is_text_only=False):
-    # SNAPPY PREMIUM ANIMATIONS (5 frames transition, small subtle 30px offset)
-    trans_dur = 5 if dur_f >= 12 else 3
-    # High-contrast solid black stroke (3px to 5px) for 100% crisp legibility on any background
-    stroke_opt = {"width": max(3, int(font_size * 0.045)), "color": "#000000"}
-    shadow_opt = {"offsetX": 0, "offsetY": 4, "blur": 16, "color": "rgba(0,0,0,0.92)"}
-    letter_spacing = -1.2 if font_weight == "bold" else -0.4
+def _append_text_item_with_keyframes(
+    items,
+    all_keyframes,
+    item_id,
+    track_id,
+    from_f,
+    dur_f,
+    label,
+    text,
+    font_size,
+    font_family,
+    font_weight,
+    color,
+    text_align,
+    pos_x,
+    pos_y,
+    text_width,
+    text_height,
+    entry_type,
+    exit_type,
+    is_text_only=False,
+    palette=None,
+    layout_style="full_screen",
+    is_light_bg=False,
+    pill_bg=None,
+):
+    fam_clean, weight_clean = editorial_engine.sanitize_font_and_weight(font_family, font_weight)
+    rng_txt = random.Random(int(hashlib.md5(f"{item_id}_{text}".encode("utf-8")).hexdigest()[:8], 16))
+    palette_eff = palette or editorial_engine.EDITORIAL_FONT_PALETTES["editorial_documentary"]
 
-    # Native Text Animations mapping (typewriter, fade, pop, cascade, blur, etc.)
-    # Map entry types to native FreeCut editor schema
-    entry_map = {
-        "typewriter": "typewriter",
-        "fade_in": "fade",
-        "rise": "slide_up",
-        "drop": "slide_down",
-        "slide_left": "slide_left",
-        "slide_right": "slide_right",
-        "cascade": "cascade",
-        "pop": "pop",
-        "blur": "blur"
-    }
-    
-    exit_map = {
-        "fade_out": "fade",
-        "rise": "slide_up",
-        "drop": "slide_down",
-        "slide_left": "slide_left",
-        "slide_right": "slide_right",
-        "sink": "sink",
-        "pop": "pop",
-        "blur": "blur"
-    }
+    word_count = max(1, len(text.split()))
+    if fam_clean in editorial_engine.SINGLE_WEIGHT_FONTS or is_text_only:
+        letter_spacing = float(palette_eff.get("display_tracking", 1.5))
+    else:
+        letter_spacing = float(palette_eff.get("body_tracking", -0.5))
 
-    items.append({
+    if is_light_bg:
+        stroke_opt = {"width": 0, "color": "transparent"}
+        shadow_opt = {"offsetX": 0, "offsetY": 0, "blur": 0, "color": "transparent"}
+    elif pill_bg and not is_text_only:
+        stroke_opt = {"width": 2, "color": "rgba(0,0,0,0.65)"}
+        shadow_opt = {"offsetX": 0, "offsetY": 4, "blur": 14, "color": "rgba(0,0,0,0.85)"}
+    else:
+        stroke_w = 3 if font_size <= 82 else 4
+        stroke_opt = {"width": stroke_w, "color": "rgba(0,0,0,0.92)"}
+        shadow_opt = {"offsetX": 0, "offsetY": 6, "blur": 20, "color": "rgba(0,0,0,0.92)"}
+
+    spans, span_layout = editorial_engine.build_editorial_spans(
+        text=text,
+        palette=palette_eff,
+        base_color=color,
+        rng=rng_txt,
+        layout_style=layout_style,
+        is_light_bg=is_light_bg,
+    )
+
+    text_motion = editorial_engine.build_native_text_motion(
+        entry_hint=entry_type,
+        exit_hint=exit_type,
+        dur_f=dur_f,
+        word_count=word_count,
+        rng=rng_txt,
+        is_text_only=is_text_only,
+    )
+
+    text_item = {
         "id": item_id,
         "trackId": track_id,
         "from": from_f,
         "durationInFrames": dur_f,
         "label": label,
         "type": "text",
-        "text": text,
+        "text": "\n".join(s["text"] for s in spans) if (spans and span_layout == "stack") else text,
         "fontSize": font_size,
-        "fontFamily": font_family,
-        "fontWeight": font_weight,
+        "fontFamily": fam_clean,
+        "fontWeight": weight_clean,
         "color": color,
         "textAlign": text_align,
         "verticalAlign": "middle",
-        "lineHeight": 1.15,
+        "lineHeight": 1.12 if is_text_only else 1.16,
         "letterSpacing": letter_spacing,
         "transform": {
             "x": pos_x,
             "y": pos_y,
             "width": text_width,
-            "height": text_height
+            "height": text_height,
         },
         "stroke": stroke_opt,
         "textShadow": shadow_opt,
-        "textAnimation": {
-            "entry": {
-                "type": entry_map.get(entry_type, "fade"),
-                "durationInFrames": trans_dur
-            },
-            "exit": {
-                "type": exit_map.get(exit_type, "fade"),
-                "durationInFrames": trans_dur
-            }
-        },
-        "originId": item_id
-    })
-    
-    x_keyframes = []
-    y_keyframes = []
-    
-    # SNAPPY PREMIUM ANIMATIONS (5 frames transition, small subtle 30px offset)
-    trans_dur = 5 if dur_f >= 12 else 3
-    
-    # Entry x & y
-    if entry_type == "slide_left":
-        x_keyframes.append({"id": get_uid(), "frame": 0, "value": pos_x + 30, "easing": "ease-out"})
-        x_keyframes.append({"id": get_uid(), "frame": trans_dur, "value": pos_x, "easing": "ease-out"})
-        y_keyframes.append({"id": get_uid(), "frame": 0, "value": pos_y, "easing": "linear"})
-        y_keyframes.append({"id": get_uid(), "frame": trans_dur, "value": pos_y, "easing": "linear"})
-    elif entry_type == "slide_right":
-        x_keyframes.append({"id": get_uid(), "frame": 0, "value": pos_x - 30, "easing": "ease-out"})
-        x_keyframes.append({"id": get_uid(), "frame": trans_dur, "value": pos_x, "easing": "ease-out"})
-        y_keyframes.append({"id": get_uid(), "frame": 0, "value": pos_y, "easing": "linear"})
-        y_keyframes.append({"id": get_uid(), "frame": trans_dur, "value": pos_y, "easing": "linear"})
-    elif entry_type == "rise":
-        x_keyframes.append({"id": get_uid(), "frame": 0, "value": pos_x, "easing": "linear"})
-        x_keyframes.append({"id": get_uid(), "frame": trans_dur, "value": pos_x, "easing": "linear"})
-        y_keyframes.append({"id": get_uid(), "frame": 0, "value": pos_y + 20, "easing": "ease-out"})
-        y_keyframes.append({"id": get_uid(), "frame": trans_dur, "value": pos_y, "easing": "ease-out"})
-    elif entry_type == "drop":
-        x_keyframes.append({"id": get_uid(), "frame": 0, "value": pos_x, "easing": "linear"})
-        x_keyframes.append({"id": get_uid(), "frame": trans_dur, "value": pos_x, "easing": "linear"})
-        y_keyframes.append({"id": get_uid(), "frame": 0, "value": pos_y - 20, "easing": "ease-out"})
-        y_keyframes.append({"id": get_uid(), "frame": trans_dur, "value": pos_y, "easing": "ease-out"})
-    else: # fade_in (stable x and y)
-        x_keyframes.append({"id": get_uid(), "frame": 0, "value": pos_x, "easing": "linear"})
-        x_keyframes.append({"id": get_uid(), "frame": trans_dur, "value": pos_x, "easing": "linear"})
-        y_keyframes.append({"id": get_uid(), "frame": 0, "value": pos_y, "easing": "linear"})
-        y_keyframes.append({"id": get_uid(), "frame": trans_dur, "value": pos_y, "easing": "linear"})
-        
-    # Exit x & y
-    exit_start = max(0, dur_f - trans_dur)
-    if exit_type == "slide_left":
-        x_keyframes.append({"id": get_uid(), "frame": exit_start, "value": pos_x, "easing": "ease-in"})
-        x_keyframes.append({"id": get_uid(), "frame": dur_f, "value": pos_x - 30, "easing": "ease-in"})
-        y_keyframes.append({"id": get_uid(), "frame": exit_start, "value": pos_y, "easing": "linear"})
-        y_keyframes.append({"id": get_uid(), "frame": dur_f, "value": pos_y, "easing": "linear"})
-    elif exit_type == "slide_right":
-        x_keyframes.append({"id": get_uid(), "frame": exit_start, "value": pos_x, "easing": "ease-in"})
-        x_keyframes.append({"id": get_uid(), "frame": dur_f, "value": pos_x + 30, "easing": "ease-in"})
-        y_keyframes.append({"id": get_uid(), "frame": exit_start, "value": pos_y, "easing": "linear"})
-        y_keyframes.append({"id": get_uid(), "frame": dur_f, "value": pos_y, "easing": "linear"})
-    elif exit_type == "rise":
-        x_keyframes.append({"id": get_uid(), "frame": exit_start, "value": pos_x, "easing": "linear"})
-        x_keyframes.append({"id": get_uid(), "frame": dur_f, "value": pos_x, "easing": "linear"})
-        y_keyframes.append({"id": get_uid(), "frame": exit_start, "value": pos_y, "easing": "ease-in"})
-        y_keyframes.append({"id": get_uid(), "frame": dur_f, "value": pos_y - 20, "easing": "ease-in"})
-    elif exit_type == "drop":
-        x_keyframes.append({"id": get_uid(), "frame": exit_start, "value": pos_x, "easing": "linear"})
-        x_keyframes.append({"id": get_uid(), "frame": dur_f, "value": pos_x, "easing": "linear"})
-        y_keyframes.append({"id": get_uid(), "frame": exit_start, "value": pos_y, "easing": "ease-in"})
-        y_keyframes.append({"id": get_uid(), "frame": dur_f, "value": pos_y + 20, "easing": "ease-in"})
-    else: # fade_out or stable exit (stable x and y)
-        x_keyframes.append({"id": get_uid(), "frame": exit_start, "value": pos_x, "easing": "linear"})
-        x_keyframes.append({"id": get_uid(), "frame": dur_f, "value": pos_x, "easing": "linear"})
-        y_keyframes.append({"id": get_uid(), "frame": exit_start, "value": pos_y, "easing": "linear"})
-        y_keyframes.append({"id": get_uid(), "frame": dur_f, "value": pos_y, "easing": "linear"})
-        
-    # Opacity keyframes
-    opacity_keyframes = [
-        {"id": get_uid(), "frame": 0, "value": 0, "easing": "ease-out"},
-        {"id": get_uid(), "frame": trans_dur, "value": 1, "easing": "ease-out"},
-        {"id": get_uid(), "frame": exit_start, "value": 1, "easing": "ease-in"},
-        {"id": get_uid(), "frame": dur_f, "value": 0, "easing": "ease-in"}
-    ]
-    
-    all_keyframes.append({
-        "itemId": item_id,
-        "properties": [
-            {"property": "x", "keyframes": x_keyframes},
-            {"property": "y", "keyframes": y_keyframes},
-            {"property": "opacity", "keyframes": opacity_keyframes}
-        ]
-    })
+        "textMotion": text_motion,
+        "originId": item_id,
+    }
+    if spans and span_layout:
+        text_item["textSpans"] = spans
+        text_item["spanLayout"] = span_layout
+    if pill_bg and not is_light_bg and not is_text_only and span_layout != "stack":
+        text_item["backgroundColor"] = pill_bg
+        text_item["backgroundRadius"] = 14
+        text_item["textPadding"] = 16
+
+    items.append(text_item)
 
 
-
-def _build_ptbr_subtitles(project_dir, scenes, items, all_keyframes, font_family="Inter"):
+def _build_ptbr_subtitles(project_dir, scenes, items, all_keyframes, font_family="Inter Tight"):
     """Adds full-video PT-BR translation subtitles positioned in the center/middle of the screen (y=0)."""
     ptbr_path = os.path.join(project_dir, "scenes_ptbr.json")
     pt_map = {}
@@ -2912,6 +2884,7 @@ def _build_ptbr_subtitles(project_dir, scenes, items, all_keyframes, font_family
         except Exception as e:
             print(f"  [Warning] Error loading scenes_ptbr.json: {e}")
 
+    fam_clean, weight_clean = editorial_engine.sanitize_font_and_weight(font_family, "bold")
     has_any = False
     for scene in scenes:
         sid = scene["id"]
@@ -2924,10 +2897,10 @@ def _build_ptbr_subtitles(project_dir, scenes, items, all_keyframes, font_family
         end_ms = scene["end_ms"]
         start_f = ms_to_frames(start_ms)
         dur_f = max(1, ms_to_frames(end_ms - start_ms))
-
         item_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{sid}_sub_ptbr"))
+        rng_pt = random.Random(int(hashlib.md5(item_id.encode("utf-8")).hexdigest()[:8], 16))
+        tm = editorial_engine.build_native_text_motion("fade-up", "fade-down", dur_f, len(pt_text.split()), rng_pt)
 
-        # High-legibility typography positioned dead-center (x=0, y=0) throughout the video
         items.append({
             "id": item_id,
             "trackId": "track_sub_ptbr",
@@ -2937,73 +2910,46 @@ def _build_ptbr_subtitles(project_dir, scenes, items, all_keyframes, font_family
             "type": "text",
             "text": pt_text.strip(),
             "fontSize": 46,
-            "fontFamily": font_family,
-            "fontWeight": "bold",
+            "fontFamily": fam_clean,
+            "fontWeight": weight_clean,
             "color": "#FFFFFF",
             "textAlign": "center",
             "verticalAlign": "middle",
             "lineHeight": 1.25,
-            "letterSpacing": -0.5,
+            "letterSpacing": -0.4,
             "transform": {
                 "x": 0,
                 "y": 0,
                 "width": 1600,
-                "height": 220
+                "height": 220,
             },
-            "stroke": {"width": 4, "color": "#000000"},
-            "textShadow": {"offsetX": 0, "offsetY": 4, "blur": 16, "color": "rgba(0,0,0,0.95)"},
-            "textAnimation": {
-                "entry": {"type": "fade", "durationInFrames": 3},
-                "exit": {"type": "fade", "durationInFrames": 3}
-            },
-            "originId": item_id
+            "stroke": {"width": 3, "color": "rgba(0,0,0,0.90)"},
+            "textShadow": {"offsetX": 0, "offsetY": 5, "blur": 18, "color": "rgba(0,0,0,0.92)"},
+            "textMotion": tm,
+            "originId": item_id,
         })
     return has_any
 
-def _build_subtitles(project_dir, scene, items, all_keyframes, add_media_fn, font_family="Montserrat"):
+
+def _build_subtitles(project_dir, scene, items, all_keyframes, add_media_fn, font_family="Inter Tight", palette=None):
     sid = scene["id"]
     start_ms = scene["start_ms"]
     end_ms = scene["end_ms"]
     start_f = ms_to_frames(start_ms)
     dur_f = ms_to_frames(end_ms - start_ms)
-    
-    # 1. Add subtitles overlay (if exists) on track_text (below media) - DEPRECATED: WebM subtitle overlay is disabled, always use native text
-    has_kinetic_txt = False
-    if False and scene.get("subtitles", False) and os.path.exists(txt_filepath):
-        media_id = add_media_fn(txt_filepath)
-        overlay_id = get_uid()
-        items.append({
-            "id": overlay_id,
-            "trackId": "track_text",
-            "from": start_f,
-            "durationInFrames": dur_f,
-            "label": f"{sid}_kinetic_text",
-            "type": "video",
-            "mediaRef": media_id,
-            "sourceWidth": 1920,
-            "sourceHeight": 1080,
-            "volume": 0.0,
-            "transform": {
-                "x": 0, "y": 0,
-                "width": CANVAS_W, "height": CANVAS_H,
-                "scaleX": 1.0, "scaleY": 1.0
-            }
-        })
-        has_kinetic_txt = True
-        
-    # 2. Add info card overlay (if exists) on track_fg_1 (ABOVE media)
+    palette_eff = palette or editorial_engine.EDITORIAL_FONT_PALETTES["editorial_documentary"]
+
+    # Add info card overlay (if rendered) on track_fg_2 (ABOVE media and separate from adjustment layers)
     card_filename = f"{sid}_card.webm"
     card_filepath = os.path.join(project_dir, "media", "videos", card_filename)
-    
+
     if os.path.exists(card_filepath):
-        # Resolve the card's position deterministically to match rendering
         info_card = scene.get("info_card") or {}
         position = info_card.get("position")
         if not position or position == "random":
             rng_card = random.Random(sid + "_card")
             position = rng_card.choice(["top_left", "top_right", "bottom_left", "bottom_right"])
-            
-        # Determine center offsets for timeline transform
+
         center_x, center_y = -610, -255
         if position == "top_right":
             center_x, center_y = 610, -255
@@ -3011,20 +2957,18 @@ def _build_subtitles(project_dir, scene, items, all_keyframes, add_media_fn, fon
             center_x, center_y = -610, 255
         elif position == "bottom_right":
             center_x, center_y = 610, 255
-            
+
         media_id = add_media_fn(card_filepath)
         overlay_id = get_uid()
-        
+
         card_meta = get_video_metadata(card_filepath)
         card_dur = card_meta["duration"] if card_meta["duration"] > 0.0 else dur_f / 30.0
-        card_dur_f = int(round(card_dur * 30.0))
-        if card_dur_f <= 0:
-            card_dur_f = dur_f
+        card_dur_f = max(1, int(round(card_dur * 30.0)))
         card_end_f = min(dur_f, card_dur_f)
-        
+
         items.append({
             "id": overlay_id,
-            "trackId": "track_fg_2",   # ABOVE media and separate from adjustment layers!
+            "trackId": "track_fg_2",
             "from": start_f,
             "durationInFrames": dur_f,
             "label": f"{sid}_info_card",
@@ -3035,23 +2979,23 @@ def _build_subtitles(project_dir, scene, items, all_keyframes, add_media_fn, fon
             "sourceStart": 0,
             "sourceEnd": card_end_f,
             "sourceDuration": card_dur_f,
-            "volume": 0.0,
+            "sourceFps": FPS,
+            "volume": -60,
             "transform": {
-                "x": center_x, "y": center_y,
-                "width": 600, "height": 500,
-                "scaleX": 1.0, "scaleY": 1.0
+                "x": center_x,
+                "y": center_y,
+                "width": 600,
+                "height": 500,
             },
-            "originId": overlay_id
+            "originId": overlay_id,
         })
-        
-    if has_kinetic_txt:
-        return
 
     # Detect if media is missing to show custom text overlay
     media_missing = False
     entry_type = "rise"
-    exit_type = "fade_out"
-    
+    exit_type = "fade-down"
+    pill_bg = None
+
     filepath_mp4 = os.path.join(project_dir, "media", "videos", f"{sid}.mp4")
     layout_style = scene.get("layout_style", "single_card")
     if os.path.exists(filepath_mp4):
@@ -3063,21 +3007,22 @@ def _build_subtitles(project_dir, scene, items, all_keyframes, add_media_fn, fon
             filepath = os.path.join(project_dir, "media", "images", filename_png)
     else:
         filename_png = f"{sid}_E01.png"
-        if layout_style in ["single_card", "split_info_slide"]:
-            filepath = os.path.join(project_dir, "media", "processed", filename_png)
-            if not os.path.exists(filepath):
-                filepath = os.path.join(project_dir, "media", "images", filename_png)
-        else: # Full Screen image
+        filepath = os.path.join(project_dir, "media", "processed", filename_png)
+        if not os.path.exists(filepath):
             filepath = os.path.join(project_dir, "media", "images", filename_png)
-            
+
     if not os.path.exists(filepath):
-        import glob
-        matches = glob.glob(os.path.join(project_dir, "media", "images", f"{sid}_*"))
+        matches = (
+            glob.glob(os.path.join(project_dir, "media", "processed", f"{sid}_*.png"))
+            + glob.glob(os.path.join(project_dir, "media", "images", f"{sid}_*"))
+        )
         if not matches:
             media_missing = True
 
+    bg_color_hex = str(scene.get("bg_color") or scene.get("background_color") or "#000000").upper()
+    is_light_bg = bg_color_hex in {"#FAF9F6", "#F5F5F7", "#F9F9FB", "#F4F4F5", "#FAF6F0", "#F5EFEB", "#EDE7E1", "#F6F0E5", "#FFFFFF"}
+
     if media_missing:
-        # Load words from words.json if possible to chunk narration to max 5 words
         words_path = os.path.join(project_dir, "words.json")
         scene_words = []
         if os.path.exists(words_path):
@@ -3092,7 +3037,7 @@ def _build_subtitles(project_dir, scene, items, all_keyframes, add_media_fn, fon
                 scene_words.sort(key=lambda x: x["start_ms"])
             except Exception as we:
                 print(f"      [Warning] Error loading words for missing media subtitle: {we}")
-                
+
         text_overlays = []
         if scene_words:
             current_chunk = []
@@ -3103,11 +3048,11 @@ def _build_subtitles(project_dir, scene, items, all_keyframes, add_media_fn, fon
                 current_chunk.append(w["word"])
                 clean_word = w["word"].strip()
                 has_punct = any(p in clean_word for p in [".", ",", "!", "?", ";"])
-                if len(current_chunk) >= 5 or has_punct or (w["end_ms"] - chunk_start > 2200):
+                if len(current_chunk) >= 4 or has_punct or (w["end_ms"] - chunk_start > 2200):
                     text_overlays.append({
                         "text": " ".join(current_chunk),
                         "appear_at_ms": chunk_start,
-                        "duration_ms": max(800, w["end_ms"] - chunk_start)
+                        "duration_ms": max(800, w["end_ms"] - chunk_start),
                     })
                     current_chunk = []
                     chunk_start = None
@@ -3115,18 +3060,19 @@ def _build_subtitles(project_dir, scene, items, all_keyframes, add_media_fn, fon
                 text_overlays.append({
                     "text": " ".join(current_chunk),
                     "appear_at_ms": chunk_start if chunk_start is not None else start_ms,
-                    "duration_ms": max(800, end_ms - (chunk_start if chunk_start is not None else start_ms))
+                    "duration_ms": max(800, end_ms - (chunk_start if chunk_start is not None else start_ms)),
                 })
         else:
             text_overlays = [{
                 "text": scene.get("narration", ""),
                 "appear_at_ms": start_ms,
-                "duration_ms": end_ms - start_ms
+                "duration_ms": end_ms - start_ms,
             }]
-            
-        font_size = 75
-        font_color = "#FFFFFF"
-        font_weight = "bold"
+
+        font_size = 72
+        font_color = "#111827" if is_light_bg else "#FFFFFF"
+        font_family = palette_eff.get("body_font", font_family)
+        font_weight = palette_eff.get("body_weight", "bold")
         text_align = "center"
         text_x = 0.0
         text_y = 0.0
@@ -3134,158 +3080,117 @@ def _build_subtitles(project_dir, scene, items, all_keyframes, add_media_fn, fon
         pos_y = 0
         text_width = 1600
         entry_type = "rise"
-        exit_type = "fade_out"
+        exit_type = "fade-down"
     else:
         text_overlays = scene.get("text_overlays", [])
         if not text_overlays:
             return
-            
+
         text_layout = scene.get("text_layout", {})
         font_size = text_layout.get("fontSize", 65)
-        font_color = text_layout.get("color", "#FFFFFF")
+        font_color = text_layout.get("color", "#111827" if is_light_bg else "#FFFFFF")
         font_family = text_layout.get("fontFamily", font_family)
         font_weight = text_layout.get("fontWeight", "bold")
         text_align = text_layout.get("textAlign", "center")
         text_x = text_layout.get("x", 0.0)
         text_y = text_layout.get("y", 0.32)
         entry_type = text_layout.get("entry", "rise")
-        exit_type = text_layout.get("exit", "fade_out")
-        
+        exit_type = text_layout.get("exit", "fade-down")
+        pill_bg = text_layout.get("pill_bg")
+
         pos_x, pos_y = norm_to_px(text_x, text_y)
-        if scene.get("layout_style") == "split_info_slide":
+        if layout_style == "split_info_slide":
             layout_params = scene.get("layout_params", {})
             split_type = layout_params.get("split_type", "horizontal")
             if split_type == "horizontal":
-                text_width = 800
-                pos_x = 480 if text_x > 0 else -480
-            else: # vertical split (top/bottom)
+                text_width = 780
+                pos_x = 470 if text_x > 0 else -470
+            else:
                 text_width = min(1500, (960 - abs(pos_x)) * 2 - 40)
         else:
             text_width = min(1500, (960 - abs(pos_x)) * 2 - 40)
-    
+
+    is_text_only = (layout_style == "text_only")
+    is_solid_bg = layout_style in ("text_only", "single_card", "split_info_slide")
+
     for idx, overlay in enumerate(text_overlays):
         txt = overlay.get("text", "")
         if not txt.strip():
             continue
-            
-        # Clamp subtitle timing strictly inside scene boundaries to prevent layout overlaps
+
         t_start = max(start_ms, overlay.get("appear_at_ms", start_ms))
         t_dur = min(end_ms - t_start, overlay.get("duration_ms", end_ms - t_start))
-        
+
         t_start_f = ms_to_frames(t_start)
         t_dur_f = max(1, ms_to_frames(t_dur))
-        
-        # Enforce non-overlapping subtitles in frames to prevent rounding overlap
+
         if idx < len(text_overlays) - 1:
             next_overlay = text_overlays[idx + 1]
             next_start = max(start_ms, next_overlay.get("appear_at_ms", start_ms))
             next_start_f = ms_to_frames(next_start)
             if next_start_f > t_start_f:
                 t_dur_f = min(t_dur_f, next_start_f - t_start_f)
-        
-        # Check if solid background layout to apply premium documentary styling
-        is_text_only = (scene.get("layout_style") == "text_only")
-        is_solid_bg = (scene.get("layout_style") in ["text_only", "single_card", "split_info_slide"])
-        
-        if False: # Disable kinetic text split entirely
-            words_list = txt.split()
-            highlight_word = None
-            highlight_idx = 0
-            
-            # Encontra primeira palavra de ênfase
-            emphasis_keywords = ["urgente", "exclusivo", "grave", "prisão", "denúncia", "operação", "provas", "revelação", "documento", "sigilo", "relatório", "stf", "tribunal", "decisão", "governo", "congresso"]
-            for i, w in enumerate(words_list):
-                w_clean = "".join(c for c in w if c.isalnum()).lower()
-                if w_clean in emphasis_keywords:
-                    highlight_word = w
-                    highlight_idx = i
-                    break
-            
-            # Se não achou palavra chave, destaca a palavra mais longa
-            if not highlight_word:
-                lengths = [len(w) for w in words_list]
-                highlight_idx = lengths.index(max(lengths))
-                highlight_word = words_list[highlight_idx]
-                
-            # Reconstrói a frase secundária sem a palavra de destaque
-            sec_words = words_list[:highlight_idx] + words_list[highlight_idx+1:]
-            sec_text = " ".join(sec_words)
-            
-            # Determina cor do destaque baseando-se na cor de fundo
-            bg_color_hex = scene.get("bg_color", "#121212")
-            is_light_bg = bg_color_hex in ["#FAF9F6", "#F5F5F7", "#F9F9FB", "#F4F4F5", "#FAF6F0", "#F5EFEB", "#EDE7E1", "#F6F0E5"]
-            if is_light_bg:
-                hl_color = "#991B1B" # Deep Rich Crimson Red
-                font_color = "#111111" # Deep Graphite Black
-            else:
-                hl_color = "#FFCC00" # Premium Gold / Yellow
-                font_color = "#FFFFFF" # Pure White
-                
-            # If not solid background, force standard text to be white
-            if not is_solid_bg:
-                font_color = "#FFFFFF"
-                
-            # 1. Adiciona o item de destaque (grande, em cima)
-            hl_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{sid}_sub_{idx}_hl"))
-            _append_text_item_with_keyframes(
-                items=items, all_keyframes=all_keyframes, item_id=hl_id, track_id="track_text",
-                from_f=t_start_f, dur_f=t_dur_f, label=f"{sid}_sub_{idx}_hl",
-                text=highlight_word.upper(), font_size=font_size + 16, font_family=font_family,
-                font_weight="bold", color=hl_color, text_align="center",
-                pos_x=pos_x, pos_y=pos_y - 65, text_width=text_width, text_height=140,
-                entry_type=entry_type, exit_type=exit_type, is_text_only=is_solid_bg
-            )
-            
-            # 2. Adiciona o item secundário (menor, embaixo)
-            sec_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{sid}_sub_{idx}_sec"))
-            _append_text_item_with_keyframes(
-                items=items, all_keyframes=all_keyframes, item_id=sec_id, track_id="track_text",
-                from_f=t_start_f, dur_f=t_dur_f, label=f"{sid}_sub_{idx}_sec",
-                text=sec_text, font_size=max(45, font_size - 14), font_family=font_family,
-                font_weight="normal", color=font_color, text_align="center",
-                pos_x=pos_x, pos_y=pos_y + 55, text_width=text_width, text_height=140,
-                entry_type=entry_type, exit_type=exit_type, is_text_only=is_solid_bg
-            )
-        else:
-            text_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{sid}_sub_{idx}"))
-            # If text_only and single word, display in uppercase
-            display_txt = txt.upper() if is_text_only else txt
-            
-            # Dynamic overlay properties with scene-level fallback
-            o_font_size = overlay.get("fontSize", font_size)
-            o_font_family = overlay.get("fontFamily", font_family)
-            o_font_weight = overlay.get("fontWeight", font_weight)
-            o_x = overlay.get("x", text_x)
-            o_y = overlay.get("y", text_y)
-            o_pos_x, o_pos_y = norm_to_px(o_x, o_y) if (o_x != text_x or o_y != text_y) else (pos_x, pos_y)
-            o_entry = overlay.get("entry", entry_type)
-            o_exit = overlay.get("exit", exit_type)
-            
-            hl_size = o_font_size + 10 if is_solid_bg else o_font_size
-            
-            _append_text_item_with_keyframes(
-                items=items, all_keyframes=all_keyframes, item_id=text_id, track_id="track_text",
-                from_f=t_start_f, dur_f=t_dur_f, label=f"{sid}_sub_{idx}",
-                text=display_txt, font_size=hl_size, font_family=o_font_family,
-                font_weight=o_font_weight, color=font_color, text_align=text_align,
-                pos_x=o_pos_x, pos_y=o_pos_y, text_width=text_width, text_height=200,
-                entry_type=o_entry, exit_type=o_exit, is_text_only=is_solid_bg
-            )
 
-def _build_scene_items(project_dir, scene, items, all_keyframes, add_media_fn, global_style="modern_grain"):
+        text_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{sid}_sub_{idx}"))
+        display_txt = txt.upper() if is_text_only else txt
+
+        o_font_size = overlay.get("fontSize", font_size)
+        o_font_family = overlay.get("fontFamily", font_family)
+        o_font_weight = overlay.get("fontWeight", font_weight)
+        o_x = overlay.get("x", text_x)
+        o_y = overlay.get("y", text_y)
+        if layout_style == "split_info_slide" and (scene.get("layout_params") or {}).get("split_type", "horizontal") == "horizontal":
+            o_pos_x = pos_x
+            _, o_pos_y = norm_to_px(0.0, o_y)
+        else:
+            o_pos_x, o_pos_y = norm_to_px(o_x, o_y) if (o_x != text_x or o_y != text_y) else (pos_x, pos_y)
+        o_entry = overlay.get("entry", entry_type)
+        o_exit = overlay.get("exit", exit_type)
+
+        hl_size = o_font_size + 4 if (is_solid_bg and not is_text_only) else o_font_size
+        box_h = 340 if is_text_only else 210
+
+        _append_text_item_with_keyframes(
+            items=items,
+            all_keyframes=all_keyframes,
+            item_id=text_id,
+            track_id="track_text",
+            from_f=t_start_f,
+            dur_f=t_dur_f,
+            label=f"{sid}_sub_{idx}",
+            text=display_txt,
+            font_size=hl_size,
+            font_family=o_font_family,
+            font_weight=o_font_weight,
+            color=font_color,
+            text_align=text_align,
+            pos_x=o_pos_x,
+            pos_y=o_pos_y,
+            text_width=text_width,
+            text_height=box_h,
+            entry_type=o_entry,
+            exit_type=o_exit,
+            is_text_only=is_text_only,
+            palette=palette_eff,
+            layout_style=layout_style,
+            is_light_bg=is_light_bg,
+            pill_bg=pill_bg,
+        )
+
+def _build_scene_items(project_dir, scene, items, all_keyframes, add_media_fn, global_style="editorial_film", palette=None):
     sid = scene["id"]
     layout_style = scene.get("layout_style", "single_card")
     start_ms = scene["start_ms"]
     end_ms = scene["end_ms"]
     duration_ms = end_ms - start_ms
     start_f = ms_to_frames(start_ms)
-    dur_f = ms_to_frames(duration_ms)
-    
-    # (Background generation disabled as per user request to keep timeline clean and show only normal media)
-        
+    dur_f = max(2, ms_to_frames(duration_ms))
+    palette_eff = palette or editorial_engine.EDITORIAL_FONT_PALETTES["editorial_documentary"]
+    accent_hex = (palette_eff.get("accents") or ["#FBBF24"])[0]
+
     is_video = False
     is_lottie = False
-    
+
     if layout_style == "text_only":
         filename_png = f"{sid}_bg.png"
         filepath = os.path.join(project_dir, "media", "processed", filename_png)
@@ -3294,12 +3199,11 @@ def _build_scene_items(project_dir, scene, items, all_keyframes, add_media_fn, g
     else:
         media = scene.get("media", {})
         source_type = media.get("source_type", "image")
-        
-        # 1. Resolve path of download
+
         filename_mp4 = f"{sid}.mp4"
         filepath_mp4 = os.path.join(project_dir, "media", "videos", filename_mp4)
         lottie_rel_path = media.get("lottie_path")
-        
+
         if source_type == "lottie" and lottie_rel_path:
             is_lottie = True
             filepath = os.path.join(project_dir, lottie_rel_path)
@@ -3310,11 +3214,14 @@ def _build_scene_items(project_dir, scene, items, all_keyframes, add_media_fn, g
             filename_png = f"{sid}_E01.png"
             filepath = os.path.join(project_dir, "media", "processed", filename_png)
             if not os.path.exists(filepath):
-                filepath = os.path.join(project_dir, "media", "images", filename_png)
-            
+                proc_matches = sorted(glob.glob(os.path.join(project_dir, "media", "processed", f"{sid}_*.png")))
+                if proc_matches:
+                    filepath = proc_matches[0]
+                else:
+                    filepath = os.path.join(project_dir, "media", "images", filename_png)
+
     if not os.path.exists(filepath):
-        # Scan fallback
-        matches = glob.glob(os.path.join(project_dir, "media", "images", f"{sid}_*"))
+        matches = sorted(glob.glob(os.path.join(project_dir, "media", "images", f"{sid}_*")))
         if matches:
             filepath = matches[0]
             if filepath.lower().endswith(".json"):
@@ -3322,11 +3229,10 @@ def _build_scene_items(project_dir, scene, items, all_keyframes, add_media_fn, g
         else:
             print(f"      [Warning] Nenhuma mídia encontrada no disco para a cena {sid}")
             return
-            
+
     media_id = add_media_fn(filepath)
     item_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{sid}_anchor"))
-    
-    # Determine aspect ratio
+
     if is_video:
         meta = get_video_metadata(filepath)
         src_w, src_h = meta["width"], meta["height"]
@@ -3338,14 +3244,14 @@ def _build_scene_items(project_dir, scene, items, all_keyframes, add_media_fn, g
                 src_w, src_h = img_file.size
         except Exception:
             src_w, src_h = 1024, 768
-            
+
     params = scene.get("layout_params", {"scale": 1.0, "x": 0.0, "y": 0.0})
     scale = params.get("scale", 1.0)
     lx = params.get("x", 0.0)
     ly = params.get("y", 0.0)
-    
+
     pos_x, pos_y = norm_to_px(lx, ly)
-    
+
     has_info_card = True if scene.get("info_card") else False
     if has_info_card and duration_ms < 5000:
         has_info_card = False
@@ -3371,18 +3277,22 @@ def _build_scene_items(project_dir, scene, items, all_keyframes, add_media_fn, g
                 bg_cat = asset_catalog.CATEGORY_BRIGHT_WHITE
             else:
                 bg_cat = asset_catalog.CATEGORY_DARK_MINIMAL
-                
+
         bg_asset = asset_catalog.get_background(
             category=bg_cat,
             mood=bg_mood,
             fallback=True,
             deterministic_seed=f"{sid}_bg"
         )
-        
+
         if bg_asset and bg_asset.exists():
             bg_media_id = add_media_fn(bg_asset.path)
             bg_item_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{sid}_bg"))
-            
+            bg_start_w = int(CANVAS_W * 1.02)
+            bg_start_h = int(CANVAS_H * 1.02)
+            bg_end_w = int(CANVAS_W * 1.06)
+            bg_end_h = int(CANVAS_H * 1.06)
+
             bg_item = {
                 "id": bg_item_id,
                 "trackId": "track_bg",
@@ -3393,236 +3303,108 @@ def _build_scene_items(project_dir, scene, items, all_keyframes, add_media_fn, g
                 "mediaRef": bg_media_id,
                 "sourceWidth": bg_asset.width,
                 "sourceHeight": bg_asset.height,
-                "volume": 0.0,  # Background video clips strictly muted (volume: 0.0)
                 "transform": {
-                    "x": 0, "y": 0,
-                    "width": CANVAS_W, "height": CANVAS_H,
-                    "scaleX": 1.0, "scaleY": 1.0
+                    "x": 0,
+                    "y": 0,
+                    "width": bg_start_w,
+                    "height": bg_start_h,
+                    "opacity": 0.78,
                 },
-                "originId": bg_item_id
+                "originId": bg_item_id,
             }
-            
+
             if bg_asset.media_type == "video":
                 bg_dur_s = bg_asset.duration_s if bg_asset.duration_s > 0 else (duration_ms / 1000.0)
-                bg_dur_f = int(round(bg_dur_s * FPS))
-                if bg_dur_f <= 0:
-                    bg_dur_f = dur_f
+                bg_dur_f = max(dur_f, int(round(bg_dur_s * FPS)))
                 bg_end_f = min(dur_f, bg_dur_f)
                 bg_item.update({
+                    "volume": -60,
                     "sourceStart": 0,
                     "sourceEnd": bg_end_f,
-                    "sourceDuration": bg_dur_f
+                    "sourceDuration": bg_dur_f,
+                    "sourceFps": FPS,
                 })
             items.append(bg_item)
-            
-            bg_start_w = int(CANVAS_W * 1.02)
-            bg_start_h = int(CANVAS_H * 1.02)
-            bg_end_w = int(CANVAS_W * 1.06)
-            bg_end_h = int(CANVAS_H * 1.06)
+
             all_keyframes.append({
                 "itemId": bg_item_id,
+                "animationVersion": 2,
                 "properties": [
                     {"property": "width", "keyframes": [
-                        {"id": get_uid(), "frame": 0, "value": bg_start_w, "easing": "linear"},
-                        {"id": get_uid(), "frame": dur_f, "value": bg_end_w, "easing": "linear"}
+                        {"id": get_uid(), "frame": 0, "value": bg_start_w, "easing": "ease-in-out"},
+                        {"id": get_uid(), "frame": dur_f, "value": bg_end_w, "easing": "linear"},
                     ]},
                     {"property": "height", "keyframes": [
-                        {"id": get_uid(), "frame": 0, "value": bg_start_h, "easing": "linear"},
-                        {"id": get_uid(), "frame": dur_f, "value": bg_end_h, "easing": "linear"}
+                        {"id": get_uid(), "frame": 0, "value": bg_start_h, "easing": "ease-in-out"},
+                        {"id": get_uid(), "frame": dur_f, "value": bg_end_h, "easing": "linear"},
                     ]},
-                    {"property": "x", "keyframes": [
-                        {"id": get_uid(), "frame": 0, "value": 0, "easing": "linear"},
-                        {"id": get_uid(), "frame": dur_f, "value": 0, "easing": "linear"}
-                    ]},
-                    {"property": "y", "keyframes": [
-                        {"id": get_uid(), "frame": 0, "value": 0, "easing": "linear"},
-                        {"id": get_uid(), "frame": dur_f, "value": 0, "easing": "linear"}
-                    ]}
                 ]
             })
 
-
-
-    # ── Active Foreground Layer Support: track_fg_1 ──
+    # ── Active Foreground Layer Support: track_fg_4 (non-overlapping with adjustments/cards) ──
     fg_config = scene.get("cutout") or scene.get("foreground")
     if fg_config and isinstance(fg_config, dict):
         fg_path = fg_config.get("path")
         if fg_path and os.path.exists(fg_path):
             fg_media_id = add_media_fn(fg_path)
-            fg_item_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{sid}_fg_1"))
-            fg_rot = max(-3.0, min(3.0, float(fg_config.get("rotation", 0.0))))
+            fg_item_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{sid}_fg_4"))
+            fg_rot = editorial_engine.normalize_angle_deg(
+                max(-3.0, min(3.0, float(fg_config.get("rotation", 0.0))))
+            )
             fg_scale = float(fg_config.get("scale", 0.7))
             fg_w = int(CANVAS_W * fg_scale)
             fg_h = int(CANVAS_H * fg_scale)
             fg_x, fg_y = norm_to_px(float(fg_config.get("x", 0.15)), float(fg_config.get("y", 0.0)))
             items.append({
                 "id": fg_item_id,
-                "trackId": "track_fg_1",
+                "trackId": "track_fg_4",
                 "from": start_f,
                 "durationInFrames": dur_f,
                 "label": f"{sid}_fg_cutout",
                 "type": "image",
                 "mediaRef": fg_media_id,
-                "volume": 0.0,
                 "transform": {
-                    "x": fg_x, "y": fg_y,
-                    "width": fg_w, "height": fg_h,
-                    "scaleX": 1.0, "scaleY": 1.0,
-                    "rotation": fg_rot
+                    "x": fg_x,
+                    "y": fg_y,
+                    "width": fg_w,
+                    "height": fg_h,
+                    "rotation": fg_rot,
                 },
-                "originId": fg_item_id
+                "originId": fg_item_id,
             })
-
-        
-    # Sorteador dinâmico de efeitos GPU com jitter baseado no preset global
-    effects_list = []
-    rng_eff = random.Random(sid + "_effects")
-    
-    if global_style == "cinematic_retro":
-        c_curve = round(rng_eff.uniform(0.20, 0.30), 2)
-        c_scan = round(rng_eff.uniform(0.20, 0.30), 2)
-        c_vig = round(rng_eff.uniform(0.25, 0.35), 2)
-        c_chroma = round(rng_eff.uniform(0.25, 0.35), 2)
-        effects_list.append({
-            "id": get_uid(), "type": "CRT", "enabled": True,
-            "params": {"curvature": c_curve, "scanlines": c_scan, "vignette": c_vig, "chroma": c_chroma},
-            "parameters": {"curvature": c_curve, "scanlines": c_scan, "vignette": c_vig, "chroma": c_chroma}
-        })
-        g_amt = round(rng_eff.uniform(0.04, 0.07), 3)
-        g_size = round(rng_eff.uniform(0.9, 1.2), 1)
-        effects_list.append({
-            "id": get_uid(), "type": "Film Grain", "enabled": True,
-            "params": {"amount": g_amt, "size": g_size, "speed": 1.0},
-            "parameters": {"amount": g_amt, "size": g_size, "speed": 1.0}
-        })
-        s_amt = round(rng_eff.uniform(1.00, 1.10), 2)
-        effects_list.append({
-            "id": get_uid(), "type": "Saturation", "enabled": True,
-            "params": {"amount": s_amt},
-            "parameters": {"amount": s_amt}
-        })
-    elif global_style == "vhs_leak":
-        c_curve = round(rng_eff.uniform(0.30, 0.40), 2)
-        c_scan = round(rng_eff.uniform(0.30, 0.40), 2)
-        c_vig = round(rng_eff.uniform(0.30, 0.40), 2)
-        c_chroma = round(rng_eff.uniform(0.40, 0.55), 2)
-        effects_list.append({
-            "id": get_uid(), "type": "CRT", "enabled": True,
-            "params": {"curvature": c_curve, "scanlines": c_scan, "vignette": c_vig, "chroma": c_chroma},
-            "parameters": {"curvature": c_curve, "scanlines": c_scan, "vignette": c_vig, "chroma": c_chroma}
-        })
-        g_amt = round(rng_eff.uniform(0.06, 0.10), 3)
-        g_size = round(rng_eff.uniform(1.1, 1.4), 1)
-        effects_list.append({
-            "id": get_uid(), "type": "Film Grain", "enabled": True,
-            "params": {"amount": g_amt, "size": g_size, "speed": 1.0},
-            "parameters": {"amount": g_amt, "size": g_size, "speed": 1.0}
-        })
-        s_amt = round(rng_eff.uniform(0.90, 1.00), 2)
-        effects_list.append({
-            "id": get_uid(), "type": "Saturation", "enabled": True,
-            "params": {"amount": s_amt},
-            "parameters": {"amount": s_amt}
-        })
-    elif global_style == "documentary_clean":
-        g_amt = round(rng_eff.uniform(0.02, 0.04), 3)
-        g_size = round(rng_eff.uniform(0.7, 0.9), 1)
-        effects_list.append({
-            "id": get_uid(), "type": "Film Grain", "enabled": True,
-            "params": {"amount": g_amt, "size": g_size, "speed": 1.0},
-            "parameters": {"amount": g_amt, "size": g_size, "speed": 1.0}
-        })
-        s_amt = round(rng_eff.uniform(1.00, 1.06), 2)
-        effects_list.append({
-            "id": get_uid(), "type": "Saturation", "enabled": True,
-            "params": {"amount": s_amt},
-            "parameters": {"amount": s_amt}
-        })
-    elif global_style == "modern_grain":
-        g_amt = round(rng_eff.uniform(0.03, 0.06), 3)
-        g_size = round(rng_eff.uniform(0.9, 1.2), 1)
-        effects_list.append({
-            "id": get_uid(), "type": "Film Grain", "enabled": True,
-            "params": {"amount": g_amt, "size": g_size, "speed": 1.0},
-            "parameters": {"amount": g_amt, "size": g_size, "speed": 1.0}
-        })
-        s_amt = round(rng_eff.uniform(1.05, 1.15), 2)
-        effects_list.append({
-            "id": get_uid(), "type": "Saturation", "enabled": True,
-            "params": {"amount": s_amt},
-            "parameters": {"amount": s_amt}
-        })
-        v_amt = round(rng_eff.uniform(0.20, 0.30), 2)
-        effects_list.append({
-            "id": get_uid(), "type": "Vignette", "enabled": True,
-            "params": {"amount": v_amt},
-            "parameters": {"amount": v_amt}
-        })
-        
-    # Sorteador dinâmico de modificadores procedimentais
-    motion_modifiers = []
-    rng_mot = random.Random(sid + "_motion")
-    if layout_style in ["single_card", "split_info_slide"] or is_lottie:
-        b_scale = round(rng_mot.uniform(1.03, 1.06), 3)
-        b_speed = round(rng_mot.uniform(0.6, 1.0), 2)
-        s_amp = rng_mot.randint(6, 12)
-        s_speed = round(rng_mot.uniform(0.4, 0.7), 2)
-        
-        motion_modifiers = [
-            {"type": "breath", "scale": b_scale, "speed": b_speed, "active": True, "enabled": True},
-            {"type": "sway", "amplitude": s_amp, "speed": s_speed, "active": True, "enabled": True}
-        ]
 
     if layout_style in ["full_screen", "text_only"] and not is_lottie:
         rng = random.Random(sid)
-        base_x = 0
-        base_y = 0
         base_w = CANVAS_W
         base_h = CANVAS_H
-        
-        # Procedural Ken Burns zoom engine with robust safety overflow to prevent any canvas border leak
-        # Apply zoom to all full-screen images (we exclude text_only and videos to keep balance)
-        apply_zoom = False
-        if not has_info_card and layout_style != "text_only" and not is_video:
-            apply_zoom = True
-            
+
+        # Smooth editorial camera push/pull on full_screen scenes
+        apply_zoom = (not has_info_card and layout_style != "text_only")
+        kb_bezier = {"type": "cubic-bezier", "bezier": {"x1": 0.25, "y1": 0.1, "x2": 0.25, "y2": 1.0}}
+
         if apply_zoom:
-            # Check camera_motion from scene or choose dynamically
             c_motion = str(scene.get("camera_motion") or "").lower().strip()
-            
-            # Multi-factor entropy seed
             rng_kb = random.Random(f"{sid}_kb_motion")
-            
-            # Determine zoom direction and type:
-            # Options: zoom_in (push-in), zoom_out (pull-out), pan_left, pan_right, tilt_up, tilt_down, diagonal
+
             if c_motion in ["zoom_out_center", "slow_pull_out", "pull_out"]:
-                motion_type = "zoom_out"
-                pan_dir = "center"
+                motion_type, pan_dir = "zoom_out", "center"
             elif c_motion in ["zoom_in_center", "slow_push_in", "push_in"]:
-                motion_type = "zoom_in"
-                pan_dir = "center"
+                motion_type, pan_dir = "zoom_in", "center"
             elif c_motion in ["pan_left", "pan_right_left"]:
-                motion_type = "pan"
-                pan_dir = "left"
+                motion_type, pan_dir = "pan", "left"
             elif c_motion in ["pan_right", "pan_left_right"]:
-                motion_type = "pan"
-                pan_dir = "right"
+                motion_type, pan_dir = "pan", "right"
             elif c_motion in ["tilt_up", "pan_bottom_top"]:
-                motion_type = "pan"
-                pan_dir = "top"
+                motion_type, pan_dir = "pan", "top"
             elif c_motion in ["tilt_down", "pan_top_bottom"]:
-                motion_type = "pan"
-                pan_dir = "bottom"
+                motion_type, pan_dir = "pan", "bottom"
             elif c_motion in ["top_left", "top_right", "bottom_left", "bottom_right"]:
-                motion_type = "zoom_in"
-                pan_dir = c_motion
+                motion_type, pan_dir = "zoom_in", c_motion
             else:
-                # Organic balanced distribution:
-                # ~40% Zoom In (Push-In), ~35% Zoom Out (Pull-Out), ~15% Pan, ~10% Diagonal
                 motion_type = rng_kb.choices(
                     ["zoom_in", "zoom_out", "pan", "diagonal"],
-                    weights=[40, 35, 15, 10],
-                    k=1
+                    weights=[42, 33, 15, 10],
+                    k=1,
                 )[0]
                 if motion_type == "zoom_in":
                     pan_dir = rng_kb.choice(["center", "top_left", "top_right", "bottom_left", "bottom_right"])
@@ -3630,151 +3412,75 @@ def _build_scene_items(project_dir, scene, items, all_keyframes, add_media_fn, g
                     pan_dir = rng_kb.choice(["center", "top", "bottom", "left", "right"])
                 elif motion_type == "pan":
                     pan_dir = rng_kb.choice(["left", "right", "top", "bottom"])
-                else: # diagonal
+                else:
                     pan_dir = rng_kb.choice(["top_left", "top_right", "bottom_left", "bottom_right"])
 
-            # Humanized micro-jitter (subtle handheld camera imperfection, -4px to +4px)
-            jitter_x = rng_kb.randint(-4, 4)
-            jitter_y = rng_kb.randint(-3, 3)
-
-            # Zoom magnitude (5% to 9% delta)
-            zoom_delta = round(rng_kb.uniform(0.05, 0.09), 3)
-            base_safety_margin = 0.05  # 5% safety scale so we never leak canvas borders
+            jitter_x = rng_kb.randint(-3, 3)
+            jitter_y = rng_kb.randint(-2, 2)
+            zoom_delta = round(rng_kb.uniform(0.03, 0.055) if is_video else rng_kb.uniform(0.055, 0.095), 3)
+            base_safety_margin = 0.035 if is_video else 0.05
 
             if motion_type == "zoom_in":
-                # Start at safety margin, zoom in to (safety + delta)
                 start_scale = 1.0 + base_safety_margin
                 end_scale = 1.0 + base_safety_margin + zoom_delta
-                
-                start_w = int(base_w * start_scale)
-                start_h = int(base_h * start_scale)
-                end_w = int(base_w * end_scale)
-                end_h = int(base_h * end_scale)
-
-                max_x = (end_w - base_w) // 2
-                max_y = (end_h - base_h) // 2
-
-                start_x = jitter_x
-                start_y = jitter_y
-
-                if pan_dir == "center":
-                    end_x = 0
-                    end_y = 0
-                elif pan_dir == "top_left":
-                    end_x = max_x
-                    end_y = max_y
-                elif pan_dir == "bottom_right":
-                    end_x = -max_x
-                    end_y = -max_y
-                elif pan_dir == "top_right":
-                    end_x = -max_x
-                    end_y = max_y
-                elif pan_dir == "bottom_left":
-                    end_x = max_x
-                    end_y = -max_y
-                elif pan_dir == "left":
-                    end_x = max_x
-                    end_y = 0
-                elif pan_dir == "right":
-                    end_x = -max_x
-                    end_y = 0
-                elif pan_dir == "top":
-                    end_x = 0
-                    end_y = max_y
-                else: # bottom
-                    end_x = 0
-                    end_y = -max_y
-
+                start_w, start_h = int(base_w * start_scale), int(base_h * start_scale)
+                end_w, end_h = int(base_w * end_scale), int(base_h * end_scale)
+                max_x, max_y = (end_w - base_w) // 2, (end_h - base_h) // 2
+                start_x, start_y = jitter_x, jitter_y
+                dir_map = {
+                    "center": (0, 0),
+                    "top_left": (max_x, max_y),
+                    "bottom_right": (-max_x, -max_y),
+                    "top_right": (-max_x, max_y),
+                    "bottom_left": (max_x, -max_y),
+                    "left": (max_x, 0),
+                    "right": (-max_x, 0),
+                    "top": (0, max_y),
+                    "bottom": (0, -max_y),
+                }
+                end_x, end_y = dir_map.get(pan_dir, (0, 0))
             elif motion_type == "zoom_out":
-                # Start zoomed in (safety + delta), zoom out to safety margin
                 start_scale = 1.0 + base_safety_margin + zoom_delta
                 end_scale = 1.0 + base_safety_margin
-                
-                start_w = int(base_w * start_scale)
-                start_h = int(base_h * start_scale)
-                end_w = int(base_w * end_scale)
-                end_h = int(base_h * end_scale)
-
-                max_x = (start_w - base_w) // 2
-                max_y = (start_h - base_h) // 2
-
-                end_x = jitter_x
-                end_y = jitter_y
-
-                if pan_dir == "center":
-                    start_x = 0
-                    start_y = 0
-                elif pan_dir == "top_left":
-                    start_x = max_x
-                    start_y = max_y
-                elif pan_dir == "bottom_right":
-                    start_x = -max_x
-                    start_y = -max_y
-                elif pan_dir == "top_right":
-                    start_x = -max_x
-                    start_y = max_y
-                elif pan_dir == "bottom_left":
-                    start_x = max_x
-                    start_y = -max_y
-                elif pan_dir == "left":
-                    start_x = max_x
-                    start_y = 0
-                elif pan_dir == "right":
-                    start_x = -max_x
-                    start_y = 0
-                elif pan_dir == "top":
-                    start_x = 0
-                    start_y = max_y
-                else: # bottom
-                    start_x = 0
-                    start_y = -max_y
-
-            else: # Pan or Diagonal constant scale drift
+                start_w, start_h = int(base_w * start_scale), int(base_h * start_scale)
+                end_w, end_h = int(base_w * end_scale), int(base_h * end_scale)
+                max_x, max_y = (start_w - base_w) // 2, (start_h - base_h) // 2
+                end_x, end_y = jitter_x, jitter_y
+                dir_map = {
+                    "center": (0, 0),
+                    "top_left": (max_x, max_y),
+                    "bottom_right": (-max_x, -max_y),
+                    "top_right": (-max_x, max_y),
+                    "bottom_left": (max_x, -max_y),
+                    "left": (max_x, 0),
+                    "right": (-max_x, 0),
+                    "top": (0, max_y),
+                    "bottom": (0, -max_y),
+                }
+                start_x, start_y = dir_map.get(pan_dir, (0, 0))
+            else:
                 fixed_scale = 1.0 + base_safety_margin + (zoom_delta / 2.0)
-                start_w = int(base_w * fixed_scale)
-                start_h = int(base_h * fixed_scale)
-                end_w = start_w
-                end_h = start_h
-
-                max_x = (start_w - base_w) // 2
-                max_y = (start_h - base_h) // 2
-
+                start_w = end_w = int(base_w * fixed_scale)
+                start_h = end_h = int(base_h * fixed_scale)
+                max_x, max_y = (start_w - base_w) // 2, (start_h - base_h) // 2
                 if pan_dir in ["left", "top_left", "bottom_left"]:
-                    start_x = -max_x + jitter_x
-                    end_x = max_x
+                    start_x, end_x = -max_x + jitter_x, max_x
                 elif pan_dir in ["right", "top_right", "bottom_right"]:
-                    start_x = max_x + jitter_x
-                    end_x = -max_x
+                    start_x, end_x = max_x + jitter_x, -max_x
                 else:
-                    start_x = jitter_x
-                    end_x = -jitter_x
-
+                    start_x, end_x = jitter_x, -jitter_x
                 if pan_dir in ["top", "top_left", "top_right"]:
-                    start_y = -max_y + jitter_y
-                    end_y = max_y
+                    start_y, end_y = -max_y + jitter_y, max_y
                 elif pan_dir in ["bottom", "bottom_left", "bottom_right"]:
-                    start_y = max_y + jitter_y
-                    end_y = -max_y
+                    start_y, end_y = max_y + jitter_y, -max_y
                 else:
-                    start_y = jitter_y
-                    end_y = -jitter_y
-
-            # Organic Easing: ease-out or ease-in-out or linear
-            kb_easing = rng_kb.choice(["linear", "ease-out", "ease-in-out"])
+                    start_y, end_y = jitter_y, -jitter_y
         else:
-            # For static items, apply a 1% safety zoom so rounding errors never expose the canvas background
             safety_scale = 1.01
-            start_w = int(base_w * safety_scale)
-            start_h = int(base_h * safety_scale)
-            end_w = start_w
-            end_h = start_h
-            start_x = 0
-            end_x = 0
-            start_y = 0
-            end_y = 0
-            kb_easing = "linear"
+            start_w = end_w = int(base_w * safety_scale)
+            start_h = end_h = int(base_h * safety_scale)
+            start_x = end_x = start_y = end_y = 0
 
-            
         full_screen_item = {
             "id": item_id,
             "trackId": "track_anchor",
@@ -3785,58 +3491,91 @@ def _build_scene_items(project_dir, scene, items, all_keyframes, add_media_fn, g
             "mediaRef": media_id,
             "sourceWidth": src_w,
             "sourceHeight": src_h,
-            "volume": 0.0 if is_video else 1.0,
             "transform": {
-                "x": start_x, "y": start_y,
-                "width": start_w, "height": start_h,
-                "scaleX": 1.0, "scaleY": 1.0
+                "x": start_x,
+                "y": start_y,
+                "width": start_w,
+                "height": start_h,
             },
-            # "effects": effects_list,
-            # "motionModifiers": motion_modifiers,
-            # "motion_modifiers": motion_modifiers,
-            "originId": item_id
+            "originId": item_id,
         }
+        if layout_style == "full_screen" and not has_info_card:
+            fs_mods = editorial_engine.build_fullscreen_motion_modifiers(sid, rng)
+            if fs_mods:
+                full_screen_item["motionModifiers"] = fs_mods
+
         if is_video:
             video_duration = meta["duration"] if "meta" in locals() else duration_ms / 1000.0
             source_dur = video_duration if video_duration > 0.0 else duration_ms / 1000.0
-            source_dur_f = int(round(source_dur * 30.0))
-            if source_dur_f <= 0:
-                source_dur_f = dur_f
-            source_end_f = min(dur_f, source_dur_f)
+            source_dur_f = max(dur_f, int(round(source_dur * float(FPS))))
+            handle_f = min(14, max(0, (source_dur_f - dur_f) // 2))
+            source_start_f = handle_f
+            source_end_f = min(source_dur_f, source_start_f + dur_f)
             full_screen_item.update({
-                "sourceStart": 0,
+                "volume": -60,
+                "sourceStart": source_start_f,
                 "sourceEnd": source_end_f,
-                "sourceDuration": source_dur_f
+                "sourceDuration": source_dur_f,
+                "sourceFps": FPS,
             })
         items.append(full_screen_item)
-        
-        all_keyframes.append({
-            "itemId": item_id,
-            "properties": [
-                {"property": "width", "keyframes": [
-                    {"id": get_uid(), "frame": 0, "value": start_w, "easing": kb_easing},
-                    {"id": get_uid(), "frame": dur_f, "value": end_w, "easing": kb_easing}
-                ]},
-                {"property": "height", "keyframes": [
-                    {"id": get_uid(), "frame": 0, "value": start_h, "easing": kb_easing},
-                    {"id": get_uid(), "frame": dur_f, "value": end_h, "easing": kb_easing}
-                ]},
-                {"property": "x", "keyframes": [
-                    {"id": get_uid(), "frame": 0, "value": start_x, "easing": kb_easing},
-                    {"id": get_uid(), "frame": dur_f, "value": end_x, "easing": kb_easing}
-                ]},
-                {"property": "y", "keyframes": [
-                    {"id": get_uid(), "frame": 0, "value": start_y, "easing": kb_easing},
-                    {"id": get_uid(), "frame": dur_f, "value": end_y, "easing": kb_easing}
-                ]}
-            ]
-        })
-        # Causal SFX for kinetic transitions only (slide, lensWarpZoom, wipe)
-        if start_f > 0 and scene.get("transition") in ["slide", "lensWarpZoom", "wipe"]:
+
+        if apply_zoom:
+            all_keyframes.append({
+                "itemId": item_id,
+                "animationVersion": 2,
+                "properties": [
+                    {"property": "width", "keyframes": [
+                        {"id": get_uid(), "frame": 0, "value": start_w, "easing": "cubic-bezier", "easingConfig": kb_bezier},
+                        {"id": get_uid(), "frame": dur_f, "value": end_w, "easing": "linear"},
+                    ]},
+                    {"property": "height", "keyframes": [
+                        {"id": get_uid(), "frame": 0, "value": start_h, "easing": "cubic-bezier", "easingConfig": kb_bezier},
+                        {"id": get_uid(), "frame": dur_f, "value": end_h, "easing": "linear"},
+                    ]},
+                    {"property": "x", "keyframes": [
+                        {"id": get_uid(), "frame": 0, "value": start_x, "easing": "cubic-bezier", "easingConfig": kb_bezier},
+                        {"id": get_uid(), "frame": dur_f, "value": end_x, "easing": "linear"},
+                    ]},
+                    {"property": "y", "keyframes": [
+                        {"id": get_uid(), "frame": 0, "value": start_y, "easing": "cubic-bezier", "easingConfig": kb_bezier},
+                        {"id": get_uid(), "frame": dur_f, "value": end_y, "easing": "linear"},
+                    ]},
+                ]
+            })
+
+        # Handcrafted editorial accent rule on text_only title cards
+        if layout_style == "text_only":
+            rule_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{sid}_editorial_rule"))
+            items.append({
+                "id": rule_id,
+                "trackId": "track_fg_3",
+                "from": start_f,
+                "durationInFrames": dur_f,
+                "label": f"{sid}_editorial_rule",
+                "type": "shape",
+                "shapeType": "rectangle",
+                "fillColor": accent_hex,
+                "fillEnabled": True,
+                "fillType": "solid",
+                "strokeEnabled": False,
+                "fadeIn": 0.22,
+                "fadeOut": 0.18,
+                "transform": {
+                    "x": 0,
+                    "y": 132,
+                    "width": 116,
+                    "height": 4,
+                    "cornerRadius": 2,
+                    "opacity": 0.92,
+                },
+                "originId": rule_id,
+            })
+
+        # Causal SFX for kinetic transitions only (frame units + dB gain)
+        if start_f > 0 and scene.get("transition") in ["slide", "lensWarpZoom", "wipe", "flip", "filmGateSlip"]:
             sfx_config = scene.get("sfx")
-            allow_sfx = True
-            if isinstance(sfx_config, dict) and sfx_config.get("enabled") is False:
-                allow_sfx = False
+            allow_sfx = not (isinstance(sfx_config, dict) and sfx_config.get("enabled") is False)
             if allow_sfx:
                 rng_sfx = random.Random(f"{sid}_trans_sfx")
                 if rng_sfx.random() < 0.35 or (isinstance(sfx_config, dict) and sfx_config.get("enabled")):
@@ -3844,51 +3583,46 @@ def _build_scene_items(project_dir, scene, items, all_keyframes, add_media_fn, g
                     if sfx_asset and sfx_asset.exists():
                         sfx_media_id = add_media_fn(sfx_asset.path)
                         sfx_item_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{sid}_sfx"))
-                        # Organic SFX volume in dB directly (-20 dB to -32 dB based on native loudness)
                         rng_vol = random.Random(f"{sid}_vol")
                         jitter_db = rng_vol.uniform(-1.5, 1.5)
                         base_db = getattr(sfx_asset, "default_gain_db", -24.0)
                         final_sfx_db = round(base_db + jitter_db, 1)
+                        sfx_dur_f = max(2, int(sfx_asset.duration_frames_30fps))
+                        clip_dur_f = min(18, sfx_dur_f, dur_f)
                         items.append({
                             "id": sfx_item_id,
                             "trackId": "track_sfx",
                             "from": start_f,
-                            "durationInFrames": sfx_asset.duration_frames_30fps,
+                            "durationInFrames": clip_dur_f,
                             "label": sfx_asset.filename,
                             "type": "audio",
                             "mediaRef": sfx_media_id,
-                            "sourceStart": 0.0,
-                            "sourceEnd": sfx_asset.duration_s,
-                            "sourceDuration": sfx_asset.duration_s,
+                            "sourceStart": 0,
+                            "sourceEnd": clip_dur_f,
+                            "sourceDuration": sfx_dur_f,
+                            "sourceFps": FPS,
                             "volume": final_sfx_db,
-                            "originId": sfx_item_id
+                            "audioFadeOut": 0.12,
+                            "originId": sfx_item_id,
                         })
-    else: # single_card, split_info_slide, or is_lottie
-        # Calculate bounding box
+    else:  # single_card, split_info_slide, or is_lottie
         card_h = int(1024 * scale)
         card_w = int(card_h * (src_w / src_h)) if src_h > 0 else int(1024 * scale)
         max_card_w = 900 if layout_style == "split_info_slide" else 1400
         if card_w > max_card_w:
             card_w = max_card_w
             card_h = int(card_w * (src_h / src_w)) if src_w > 0 else card_h
-            
+
         rng = random.Random(sid)
         base_x = pos_x
         base_y = pos_y
         base_w = card_w
         base_h = card_h
-        
-        apply_zoom = False
-        if not has_info_card and not is_lottie:
-            apply_zoom = rng.choice([True, False])
-            
-        zoom_pct = round(rng.uniform(0.04, 0.08), 3)
+
+        apply_zoom = (not has_info_card and not is_lottie and rng.random() < 0.55)
+        zoom_pct = round(rng.uniform(0.035, 0.065), 3)
         zoom_in = rng.choice([True, False])
-        pan_type = rng.choice(["center", "top_left", "bottom_right", "top_right", "bottom_left"])
-        
-        jitter_x = rng.randint(-3, 3)
-        jitter_y = rng.randint(-3, 3)
-        
+
         if apply_zoom:
             if zoom_in:
                 start_w, end_w = base_w, int(base_w * (1.0 + zoom_pct))
@@ -3896,76 +3630,38 @@ def _build_scene_items(project_dir, scene, items, all_keyframes, add_media_fn, g
             else:
                 start_w, end_w = int(base_w * (1.0 + zoom_pct)), base_w
                 start_h, end_h = int(base_h * (1.0 + zoom_pct)), base_h
-                
-            dx_start = start_w - base_w
-            dx_end = end_w - base_w
-            dy_start = start_h - base_h
-            dy_end = end_h - base_h
-            
-            if pan_type == "center":
-                start_x = int(base_x - dx_start / 2) + jitter_x
-                end_x = int(base_x - dx_end / 2)
-                start_y = int(base_y - dy_start / 2) + jitter_y
-                end_y = int(base_y - dy_end / 2)
-            elif pan_type == "top_left":
-                start_x = base_x + jitter_x
-                end_x = base_x
-                start_y = base_y + jitter_y
-                end_y = base_y
-            elif pan_type == "bottom_right":
-                start_x = base_x - dx_start + jitter_x
-                end_x = base_x - dx_end
-                start_y = base_y - dy_start + jitter_y
-                end_y = base_y - dy_end
-            elif pan_type == "top_right":
-                start_x = base_x - dx_start + jitter_x
-                end_x = base_x - dx_end
-                start_y = base_y + jitter_y
-                end_y = base_y
-            else: # bottom_left
-                start_x = base_x + jitter_x
-                end_x = base_x
-                start_y = base_y - dy_start + jitter_y
-                end_y = base_y - dy_end
+            start_x, end_x = base_x, base_x
+            start_y, end_y = base_y, base_y
         else:
             start_w, end_w = base_w, base_w
             start_h, end_h = base_h, base_h
             start_x, end_x = base_x, base_x
             start_y, end_y = base_y, base_y
- 
-        # Dynamic Animation Parameter Calculator for cards/lotties (entrance slide & slow float wave)
-        # 1. Entrance parameters (slide from screen edges)
+
         sfx_config = scene.get("sfx")
         if isinstance(sfx_config, dict) and sfx_config.get("enabled"):
             apply_entrance = True
         else:
-            apply_entrance = rng.choice([True, True, False]) # 66% chance of slide entrance
+            apply_entrance = rng.random() < 0.68
         entrance_dir = rng.choice(["left", "right", "top", "bottom"])
-        intro_dur = 14 # ~0.45 seconds at 30 FPS
-        if intro_dur >= dur_f:
+        intro_dur = 15  # 0.50s tactile card entrance at 30 FPS
+        if intro_dur >= dur_f - 2:
             apply_entrance = False
-            
-        # 2. Float parameters (subtle, slow organic oscillation)
-        apply_float = rng.choice([True, False, False, False]) # 25% chance of slow float
-        float_amp = rng.randint(8, 16)
-        float_period = rng.randint(85, 140) # Slower period: 2.8s to 4.6s (reduced speed by 30%+)
-        
-        # Calculate initial coordinates for default transform
+
         init_x = start_x
         init_y = start_y
-        
-        if apply_entrance:
-            # Shift starting positions off-screen natively using center-based coordinates (1920x1080 canvas from -960 to 960 and -540 to 540)
-            if entrance_dir == "left":
-                init_x = -960 - (start_w // 2) - 50
-            elif entrance_dir == "right":
-                init_x = 960 + (start_w // 2) + 50
-            elif entrance_dir == "top":
-                init_y = 540 + (start_h // 2) + 50
-            elif entrance_dir == "bottom":
-                init_y = -540 - (start_h // 2) - 50
 
-        # Organic card rotations clamped strictly between [-3.0°, +3.0°]
+        if apply_entrance:
+            # FreeCut canvas coordinates: X in [-960, +960], Y in [-540 (top), +540 (bottom)]
+            if entrance_dir == "left":
+                init_x = -960 - (start_w // 2) - 60
+            elif entrance_dir == "right":
+                init_x = 960 + (start_w // 2) + 60
+            elif entrance_dir == "top":
+                init_y = -540 - (start_h // 2) - 60
+            elif entrance_dir == "bottom":
+                init_y = 540 + (start_h // 2) + 60
+
         card_rotation = 0.0
         if "rotation" in scene:
             try:
@@ -3978,6 +3674,11 @@ def _build_scene_items(project_dir, scene, items, all_keyframes, add_media_fn, g
             card_rotation = round(sign * rng_rot.uniform(0.8, 2.5), 1)
             card_rotation = max(-3.0, min(3.0, card_rotation))
 
+        raw_card_rotation = round(float(card_rotation), 2)
+        card_rotation = editorial_engine.normalize_angle_deg(raw_card_rotation)
+        rng_mot = random.Random(sid + "_motion")
+        card_motion_mods = editorial_engine.build_card_motion_modifiers(sid, rng_mot)
+
         card_item = {
             "id": item_id,
             "trackId": "track_anchor",
@@ -3988,43 +3689,68 @@ def _build_scene_items(project_dir, scene, items, all_keyframes, add_media_fn, g
             "mediaRef": media_id,
             "sourceWidth": src_w,
             "sourceHeight": src_h,
-            "volume": 0.0 if (is_video or is_lottie) else 1.0,
             "transform": {
-                "x": init_x, "y": init_y,
-                "width": start_w, "height": start_h,
-                "scaleX": 1.0, "scaleY": 1.0,
+                "x": init_x,
+                "y": init_y,
+                "width": start_w,
+                "height": start_h,
                 "rotation": card_rotation,
-                "cornerRadius": 0 if is_lottie else (85 if is_video else 48),
-                "dropShadow": {"blur": 24, "color": "rgba(0,0,0,0.45)", "offsetX": 0, "offsetY": 8}
+                "cornerRadius": 28 if is_video else 0,
             },
-            "originId": item_id
+            "motionModifiers": card_motion_mods,
+            "originId": item_id,
         }
         if is_video:
             video_duration = meta["duration"] if "meta" in locals() else duration_ms / 1000.0
             source_dur = video_duration if video_duration > 0.0 else duration_ms / 1000.0
-            source_dur_f = int(round(source_dur * 30.0))
-            if source_dur_f <= 0:
-                source_dur_f = dur_f
+            source_dur_f = max(dur_f, int(round(source_dur * float(FPS))))
             source_end_f = min(dur_f, source_dur_f)
             card_item.update({
+                "volume": -60,
                 "sourceStart": 0,
                 "sourceEnd": source_end_f,
-                "sourceDuration": source_dur_f
+                "sourceDuration": source_dur_f,
+                "sourceFps": FPS,
             })
         items.append(card_item)
-        
-        # Causal SFX tied strictly to physical slide entrance of card
+
+        # Subtle center-gutter editorial accent bar on horizontal split_info_slide scenes
+        if layout_style == "split_info_slide" and params.get("split_type", "horizontal") == "horizontal":
+            div_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{sid}_split_divider"))
+            items.append({
+                "id": div_id,
+                "trackId": "track_fg_3",
+                "from": start_f,
+                "durationInFrames": dur_f,
+                "label": f"{sid}_split_divider",
+                "type": "shape",
+                "shapeType": "rectangle",
+                "fillColor": accent_hex,
+                "fillEnabled": True,
+                "fillType": "solid",
+                "strokeEnabled": False,
+                "fadeIn": 0.25,
+                "fadeOut": 0.20,
+                "transform": {
+                    "x": 0,
+                    "y": 0,
+                    "width": 3,
+                    "height": 260,
+                    "cornerRadius": 2,
+                    "opacity": 0.42,
+                },
+                "originId": div_id,
+            })
+
+        # Causal SFX tied strictly to physical slide entrance of card (frame units + dB)
         if apply_entrance and start_f > 0:
             sfx_config = scene.get("sfx")
-            allow_sfx = True
-            if isinstance(sfx_config, dict) and sfx_config.get("enabled") is False:
-                allow_sfx = False
+            allow_sfx = not (isinstance(sfx_config, dict) and sfx_config.get("enabled") is False)
             if allow_sfx:
                 sfx_asset = asset_catalog.get_sfx(kind="whoosh", fallback=True, deterministic_seed=f"{sid}_sfx")
                 if sfx_asset and sfx_asset.exists():
                     sfx_media_id = add_media_fn(sfx_asset.path)
                     sfx_item_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{sid}_sfx"))
-                    # Organic SFX volume in dB directly (-20 dB to -32 dB based on native loudness)
                     rng_vol = random.Random(f"{sid}_vol")
                     jitter_db = rng_vol.uniform(-1.5, 1.5)
                     base_db = getattr(sfx_asset, "default_gain_db", -24.0)
@@ -4032,378 +3758,180 @@ def _build_scene_items(project_dir, scene, items, all_keyframes, add_media_fn, g
                     if isinstance(sfx_config, dict) and "volume" in sfx_config:
                         try:
                             raw_v = float(sfx_config["volume"])
-                            final_sfx_db = max(-45.0, min(-10.0, raw_v if raw_v < 0 else -abs(raw_v)))
+                            if raw_v < 0:
+                                final_sfx_db = max(-45.0, min(-12.0, raw_v))
                         except (ValueError, TypeError):
                             pass
+                    sfx_dur_f = max(2, int(sfx_asset.duration_frames_30fps))
+                    clip_dur_f = min(intro_dur + 3, sfx_dur_f, dur_f)
                     items.append({
                         "id": sfx_item_id,
                         "trackId": "track_sfx",
                         "from": start_f,
-                        "durationInFrames": min(intro_dur, sfx_asset.duration_frames_30fps),
+                        "durationInFrames": clip_dur_f,
                         "label": sfx_asset.filename,
                         "type": "audio",
                         "mediaRef": sfx_media_id,
-                        "sourceStart": 0.0,
-                        "sourceEnd": sfx_asset.duration_s,
-                        "sourceDuration": sfx_asset.duration_s,
+                        "sourceStart": 0,
+                        "sourceEnd": clip_dur_f,
+                        "sourceDuration": sfx_dur_f,
+                        "sourceFps": FPS,
                         "volume": final_sfx_db,
-                        "originId": sfx_item_id
+                        "audioFadeOut": 0.12,
+                        "originId": sfx_item_id,
                     })
-        
-        # Build width/height zoom keyframes
-        width_kfs = [
-            {"id": get_uid(), "frame": 0, "value": start_w, "easing": "linear"},
-            {"id": get_uid(), "frame": dur_f, "value": end_w, "easing": "linear"}
-        ]
-        height_kfs = [
-            {"id": get_uid(), "frame": 0, "value": start_h, "easing": "linear"},
-            {"id": get_uid(), "frame": dur_f, "value": end_h, "easing": "linear"}
-        ]
-        
-        # Build x and y keyframes
-        x_kfs = []
-        y_kfs = []
-        
-        if apply_entrance:
-            x_kfs.append({"id": get_uid(), "frame": 0, "value": init_x, "easing": "ease-out"})
-            y_kfs.append({"id": get_uid(), "frame": 0, "value": init_y, "easing": "ease-out"})
-            
-            # Interpolated base center positions at the end of entrance
-            ratio_intro = intro_dur / float(dur_f)
-            base_x_intro = int(start_x + (end_x - start_x) * ratio_intro)
-            base_y_intro = int(start_y + (end_y - start_y) * ratio_intro)
-            
-            x_kfs.append({"id": get_uid(), "frame": intro_dur, "value": base_x_intro, "easing": "linear"})
-            y_kfs.append({"id": get_uid(), "frame": intro_dur, "value": base_y_intro, "easing": "linear"})
-            
-            start_f_range = intro_dur
+
+        # Tactile spring / expo-out keyframes (Schema v15 animationVersion: 2, zero linear sine spam)
+        drift_bezier = {"type": "cubic-bezier", "bezier": {"x1": 0.25, "y1": 0.1, "x2": 0.25, "y2": 1.0}}
+        use_spring = rng.random() < 0.55
+        if use_spring:
+            entrance_easing = "spring"
+            entrance_cfg = {
+                "type": "spring",
+                "spring": {
+                    "tension": rng.randint(175, 215),
+                    "friction": rng.randint(20, 25),
+                    "mass": 1.0,
+                },
+            }
         else:
-            x_kfs.append({"id": get_uid(), "frame": 0, "value": start_x, "easing": "linear"})
-            y_kfs.append({"id": get_uid(), "frame": 0, "value": start_y, "easing": "linear"})
-            start_f_range = 0
-            
-        # Add intermediate keyframes for floating/sway oscillation
-        sample_step = 12
-        for f in range(start_f_range + sample_step, dur_f, sample_step):
-            t_ratio = (f - start_f_range) / float(dur_f - start_f_range) if dur_f > start_f_range else 1.0
-            
-            if apply_entrance:
-                ratio_intro = start_f_range / float(dur_f)
-                x_base_start = start_x + (end_x - start_x) * ratio_intro
-                y_base_start = start_y + (end_y - start_y) * ratio_intro
-                x_base = int(x_base_start + (end_x - x_base_start) * t_ratio)
-                y_base = int(y_base_start + (end_y - y_base_start) * t_ratio)
-            else:
-                x_base = int(start_x + (end_x - start_x) * t_ratio)
-                y_base = int(start_y + (end_y - start_y) * t_ratio)
-                
-            if apply_float:
-                import math
-                y_offset = int(float_amp * math.sin(2 * math.pi * (f - start_f_range) / float_period))
-                x_offset = int((float_amp // 3) * math.cos(2 * math.pi * (f - start_f_range) / float_period))
-                x_val = x_base + x_offset
-                y_val = y_base + y_offset
-            else:
-                x_val = x_base
-                y_val = y_base
-                
-            x_kfs.append({"id": get_uid(), "frame": f, "value": x_val, "easing": "linear"})
-            y_kfs.append({"id": get_uid(), "frame": f, "value": y_val, "easing": "linear"})
-            
-        # Final keyframes
-        x_kfs.append({"id": get_uid(), "frame": dur_f, "value": end_x, "easing": "linear"})
-        y_kfs.append({"id": get_uid(), "frame": dur_f, "value": end_y, "easing": "linear"})
-        
-        rot_kfs = [
-            {"id": get_uid(), "frame": 0, "value": card_rotation, "easing": "linear"},
-            {"id": get_uid(), "frame": dur_f, "value": card_rotation, "easing": "linear"}
-        ]
-        
-        all_keyframes.append({
-            "itemId": item_id,
-            "properties": [
-                {"property": "width", "keyframes": width_kfs},
-                {"property": "height", "keyframes": height_kfs},
-                {"property": "x", "keyframes": x_kfs},
-                {"property": "y", "keyframes": y_kfs},
-                {"property": "rotation", "keyframes": rot_kfs}
-            ]
-        })
-def _build_scene_adjustments(project_id, scenes, items):
+            entrance_easing = "cubic-bezier"
+            entrance_cfg = {
+                "type": "cubic-bezier",
+                "bezier": {"x1": 0.16, "y1": 1.0, "x2": 0.3, "y2": 1.0},
+            }
+
+        kf_props = []
+        if start_w != end_w or start_h != end_h:
+            kf_props.append({
+                "property": "width",
+                "keyframes": [
+                    {"id": get_uid(), "frame": 0, "value": start_w, "easing": "cubic-bezier", "easingConfig": drift_bezier},
+                    {"id": get_uid(), "frame": dur_f, "value": end_w, "easing": "linear"},
+                ],
+            })
+            kf_props.append({
+                "property": "height",
+                "keyframes": [
+                    {"id": get_uid(), "frame": 0, "value": start_h, "easing": "cubic-bezier", "easingConfig": drift_bezier},
+                    {"id": get_uid(), "frame": dur_f, "value": end_h, "easing": "linear"},
+                ],
+            })
+
+        if apply_entrance:
+            kf_props.append({
+                "property": "x",
+                "keyframes": [
+                    {"id": get_uid(), "frame": 0, "value": init_x, "easing": entrance_easing, "easingConfig": entrance_cfg},
+                    {"id": get_uid(), "frame": intro_dur, "value": start_x, "easing": "linear"},
+                    {"id": get_uid(), "frame": dur_f, "value": end_x, "easing": "linear"},
+                ],
+            })
+            kf_props.append({
+                "property": "y",
+                "keyframes": [
+                    {"id": get_uid(), "frame": 0, "value": init_y, "easing": entrance_easing, "easingConfig": entrance_cfg},
+                    {"id": get_uid(), "frame": intro_dur, "value": start_y, "easing": "linear"},
+                    {"id": get_uid(), "frame": dur_f, "value": end_y, "easing": "linear"},
+                ],
+            })
+            settled_rot = raw_card_rotation
+            intro_rot = round(
+                raw_card_rotation + (2.2 if entrance_dir in ["left", "top"] else -2.2),
+                2,
+            )
+            kf_props.append({
+                "property": "rotation",
+                "keyframes": [
+                    {"id": get_uid(), "frame": 0, "value": intro_rot, "easing": entrance_easing, "easingConfig": entrance_cfg},
+                    {"id": get_uid(), "frame": intro_dur, "value": settled_rot, "easing": "linear"},
+                ],
+            })
+        elif start_x != end_x or start_y != end_y:
+            kf_props.append({
+                "property": "x",
+                "keyframes": [
+                    {"id": get_uid(), "frame": 0, "value": start_x, "easing": "cubic-bezier", "easingConfig": drift_bezier},
+                    {"id": get_uid(), "frame": dur_f, "value": end_x, "easing": "linear"},
+                ],
+            })
+            kf_props.append({
+                "property": "y",
+                "keyframes": [
+                    {"id": get_uid(), "frame": 0, "value": start_y, "easing": "cubic-bezier", "easingConfig": drift_bezier},
+                    {"id": get_uid(), "frame": dur_f, "value": end_y, "easing": "linear"},
+                ],
+            })
+
+        if kf_props:
+            all_keyframes.append({
+                "itemId": item_id,
+                "animationVersion": 2,
+                "properties": kf_props,
+            })
+
+
+def _build_scene_adjustments(project_id, scenes, items, palette=None, explicit_style=""):
     if not scenes:
         return
-        
-    # Seed random generator with the project id to keep it deterministic
+
     import random as prng
     rng = prng.Random(f"{project_id}_adjustments")
-    
-    # 1. Choose a random percentage of eligible scenes (not text_only) to have effects (10% to 40%)
+    palette_eff = palette or editorial_engine.EDITORIAL_FONT_PALETTES["editorial_documentary"]
+    lut_pool = palette_eff.get("lut_presets") or ["kodak-2383-d65", "fuji-3513-d65", "warm-film", "cinematic"]
+
     eligible_indices = [i for i, s in enumerate(scenes) if s.get("layout_style") != "text_only"]
     if not eligible_indices:
-        print("  [Adjustment Layers] Nenhuma cena elegível para efeitos (todas são text_only).")
         return
-        
+
     num_eligible = len(eligible_indices)
-    pct = rng.uniform(0.10, 0.40)
-    num_effects = max(1, int(round(num_eligible * pct)))
-    num_effects = min(num_effects, num_eligible)
-    
-    # Randomly select which scene indices will have effects
-    effect_indices = rng.sample(eligible_indices, num_effects)
-    print(f"  [Adjustment Layers] Aplicando camadas de ajuste em {num_effects} de {num_eligible} cenas elegíveis (indices: {effect_indices})")
-    
-    project_styles = ["cinematic_retro", "vhs_leak", "vintage_sepia", "noir_bw", "modern_grain", "trigger_wave", "documentary_clean"]
-    
+    pct = rng.uniform(0.28, 0.45)
+    num_effects = max(1, min(num_eligible, int(round(num_eligible * pct))))
+    effect_indices = sorted(rng.sample(eligible_indices, num_effects))
+    print(f"  [Color Grading] Aplicando LUT editorial + micro-textura em {num_effects} de {num_eligible} cenas")
+
+    explicit_norm = (explicit_style or "").strip().lower()
+
     for idx in effect_indices:
         scene = scenes[idx]
         sid = scene["id"]
         start_f = ms_to_frames(scene["start_ms"])
-        dur_f = ms_to_frames(scene["end_ms"] - scene["start_ms"])
-        
-        # Sorteia o estilo para esta cena específica
-        style = rng.choice(project_styles)
-        
-        # Semente baseada no ID da cena para calibrar os valores deste clipe
+        dur_f = max(2, ms_to_frames(scene["end_ms"] - scene["start_ms"]))
         rng_scene = prng.Random(f"{sid}_effects_calib")
-        
         effects_list = []
-        
-        if style == "cinematic_retro":
-            # 1. CRT (Slightly warped analog monitor look)
+
+        if explicit_norm in ("vhs_leak", "cinematic_retro", "noir_bw"):
+            style_label = explicit_norm.upper().replace("_", " ")
+            if explicit_norm == "noir_bw":
+                effects_list.append({
+                    "id": str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{sid}_effect_grayscale")),
+                    "effect": {"type": "gpu-effect", "gpuEffectType": "gpu-grayscale", "params": {"amount": 1.0}},
+                    "enabled": True,
+                })
+                effects_list.append({
+                    "id": str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{sid}_effect_contrast")),
+                    "effect": {"type": "gpu-effect", "gpuEffectType": "gpu-contrast", "params": {"amount": round(rng_scene.uniform(1.12, 1.24), 2)}},
+                    "enabled": True,
+                })
+            else:
+                effects_list.append({
+                    "id": str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{sid}_effect_grain")),
+                    "effect": {"type": "gpu-effect", "gpuEffectType": "gpu-grain", "params": {"amount": round(rng_scene.uniform(0.025, 0.045), 3), "size": 0.9, "speed": 1}},
+                    "enabled": True,
+                })
+        else:
+            chosen_lut = rng_scene.choice(lut_pool)
+            lut_intensity = round(rng_scene.uniform(0.26, 0.42), 2)
+            style_label = f"LUT {chosen_lut.upper()}"
             effects_list.append({
-                "id": str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{sid}_effect_crt")),
+                "id": str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{sid}_effect_lut")),
                 "effect": {
-                    "type": "gpu-effect",
-                    "gpuEffectType": "gpu-crt",
-                    "params": {
-                        "curvature": round(rng_scene.uniform(0.12, 0.18), 2),
-                        "scanlines": round(rng_scene.uniform(0.15, 0.22), 2),
-                        "vignette": round(rng_scene.uniform(0.18, 0.25), 2),
-                        "chroma": round(rng_scene.uniform(0.15, 0.25), 2)
-                    }
+                    "type": "color-grading",
+                    "variant": "lut",
+                    "preset": chosen_lut,
+                    "intensity": lut_intensity,
                 },
-                "enabled": True
-            })
-            # 2. Grain (Subtle film grain)
-            effects_list.append({
-                "id": str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{sid}_effect_grain")),
-                "effect": {
-                    "type": "gpu-effect",
-                    "gpuEffectType": "gpu-grain",
-                    "params": {
-                        "amount": round(rng_scene.uniform(0.02, 0.045), 3),
-                        "size": round(rng_scene.uniform(0.8, 1.1), 1),
-                        "speed": 1
-                    }
-                },
-                "enabled": True
-            })
-            # 3. Saturation (Warm cinematic boost)
-            effects_list.append({
-                "id": str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{sid}_effect_sat")),
-                "effect": {
-                    "type": "gpu-effect",
-                    "gpuEffectType": "gpu-saturation",
-                    "params": {
-                        "amount": round(rng_scene.uniform(1.02, 1.12), 2)
-                    }
-                },
-                "enabled": True
-            })
-        elif style == "vhs_leak":
-            # 1. VHS (Slight tape damage)
-            effects_list.append({
-                "id": str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{sid}_effect_vhs")),
-                "effect": {
-                    "type": "gpu-effect",
-                    "gpuEffectType": "gpu-vhs",
-                    "params": {
-                        "bleed": round(rng_scene.uniform(0.20, 0.30), 2),
-                        "waviness": round(rng_scene.uniform(0.10, 0.20), 2),
-                        "noise": round(rng_scene.uniform(0.06, 0.10), 2),
-                        "scanline": round(rng_scene.uniform(0.10, 0.18), 2),
-                        "speed": 1
-                    }
-                },
-                "enabled": True
-            })
-            # 2. CRT
-            effects_list.append({
-                "id": str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{sid}_effect_crt")),
-                "effect": {
-                    "type": "gpu-effect",
-                    "gpuEffectType": "gpu-crt",
-                    "params": {
-                        "curvature": round(rng_scene.uniform(0.10, 0.18), 2),
-                        "scanlines": round(rng_scene.uniform(0.12, 0.20), 2),
-                        "vignette": round(rng_scene.uniform(0.18, 0.25), 2),
-                        "chroma": round(rng_scene.uniform(0.12, 0.22), 2)
-                    }
-                },
-                "enabled": True
-            })
-            # 3. Grain
-            effects_list.append({
-                "id": str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{sid}_effect_grain")),
-                "effect": {
-                    "type": "gpu-effect",
-                    "gpuEffectType": "gpu-grain",
-                    "params": {
-                        "amount": round(rng_scene.uniform(0.025, 0.045), 3),
-                        "size": round(rng.uniform(0.9, 1.1), 1),
-                        "speed": 1
-                    }
-                },
-                "enabled": True
-            })
-        elif style == "vintage_sepia":
-            # 1. Sepia
-            effects_list.append({
-                "id": str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{sid}_effect_sepia")),
-                "effect": {
-                    "type": "gpu-effect",
-                    "gpuEffectType": "gpu-sepia",
-                    "params": {
-                        "amount": round(rng_scene.uniform(0.20, 0.35), 2)
-                    }
-                },
-                "enabled": True
-            })
-            # 2. Contrast
-            effects_list.append({
-                "id": str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{sid}_effect_contrast")),
-                "effect": {
-                    "type": "gpu-effect",
-                    "gpuEffectType": "gpu-contrast",
-                    "params": {
-                        "amount": round(rng_scene.uniform(1.05, 1.15), 2)
-                    }
-                },
-                "enabled": True
-            })
-            # 3. Brightness
-            effects_list.append({
-                "id": str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{sid}_effect_brightness")),
-                "effect": {
-                    "type": "gpu-effect",
-                    "gpuEffectType": "gpu-brightness",
-                    "params": {
-                        "amount": round(rng_scene.uniform(-0.08, -0.04), 2)
-                    }
-                },
-                "enabled": True
-            })
-        elif style == "noir_bw":
-            # 1. Grayscale
-            effects_list.append({
-                "id": str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{sid}_effect_grayscale")),
-                "effect": {
-                    "type": "gpu-effect",
-                    "gpuEffectType": "gpu-grayscale",
-                    "params": {
-                        "amount": 1.0
-                    }
-                },
-                "enabled": True
-            })
-            # 2. Contrast
-            effects_list.append({
-                "id": str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{sid}_effect_contrast")),
-                "effect": {
-                    "type": "gpu-effect",
-                    "gpuEffectType": "gpu-contrast",
-                    "params": {
-                        "amount": round(rng_scene.uniform(1.15, 1.30), 2)
-                    }
-                },
-                "enabled": True
-            })
-        elif style == "modern_grain":
-            # 1. Grain
-            effects_list.append({
-                "id": str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{sid}_effect_grain")),
-                "effect": {
-                    "type": "gpu-effect",
-                    "gpuEffectType": "gpu-grain",
-                    "params": {
-                        "amount": round(rng_scene.uniform(0.015, 0.035), 3),
-                        "size": round(rng_scene.uniform(0.8, 1.1), 1),
-                        "speed": 1
-                    }
-                },
-                "enabled": True
-            })
-        elif style == "trigger_wave":
-            # 1. Trigger Wave (disabled by default)
-            effects_list.append({
-                "id": str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{sid}_effect_trigger")),
-                "effect": {
-                    "type": "gpu-effect",
-                    "gpuEffectType": "gpu-trigger-wave",
-                    "params": {
-                        "strength": 0.04, "radius": 0.9, "frequency": 20, "decay": 0.07,
-                        "phase": 0, "speed": 0.8, "centerX": 0.5, "centerY": 0.5,
-                        "chroma": 0.008, "scanlineMix": 0.2, "glowColor": "#2e6b8c"
-                    }
-                },
-                "enabled": False
-            })
-            # 2. RGB Split
-            effects_list.append({
-                "id": str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{sid}_effect_rgb")),
-                "effect": {
-                    "type": "gpu-effect",
-                    "gpuEffectType": "gpu-rgb-split",
-                    "params": {
-                        "amount": round(rng_scene.uniform(0.004, 0.007), 4),
-                        "angle": 0
-                    }
-                },
-                "enabled": True
-            })
-            # 3. Scanlines
-            effects_list.append({
-                "id": str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{sid}_effect_scanlines")),
-                "effect": {
-                    "type": "gpu-effect",
-                    "gpuEffectType": "gpu-scanlines",
-                    "params": {
-                        "density": 8,
-                        "opacity": round(rng_scene.uniform(0.10, 0.16), 2),
-                        "speed": 0.6
-                    }
-                },
-                "enabled": True
-            })
-            # 4. Grain
-            effects_list.append({
-                "id": str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{sid}_effect_grain")),
-                "effect": {
-                    "type": "gpu-effect",
-                    "gpuEffectType": "gpu-grain",
-                    "params": {
-                        "amount": round(rng_scene.uniform(0.02, 0.045), 3),
-                        "size": round(rng_scene.uniform(0.8, 1.1), 1),
-                        "speed": 1
-                    }
-                },
-                "enabled": True
-            })
-        elif style == "documentary_clean":
-            # Subtle vignette + grain
-            effects_list.append({
-                "id": str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{sid}_effect_vignette")),
-                "effect": {
-                    "type": "gpu-effect",
-                    "gpuEffectType": "gpu-vignette",
-                    "params": {
-                        "amount": round(rng_scene.uniform(0.35, 0.50), 2),
-                        "size": 0.5,
-                        "softness": 0.5,
-                        "roundness": 1
-                    }
-                },
-                "enabled": True
+                "enabled": True,
             })
             effects_list.append({
                 "id": str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{sid}_effect_grain")),
@@ -4411,13 +3939,28 @@ def _build_scene_adjustments(project_id, scenes, items):
                     "type": "gpu-effect",
                     "gpuEffectType": "gpu-grain",
                     "params": {
-                        "amount": 0.012,
-                        "size": 0.8,
-                        "speed": 1
-                    }
+                        "amount": round(rng_scene.uniform(0.014, 0.026), 3),
+                        "size": round(rng_scene.uniform(0.8, 1.0), 1),
+                        "speed": 1,
+                    },
                 },
-                "enabled": True
+                "enabled": True,
             })
+            if scene.get("layout_style") == "full_screen":
+                effects_list.append({
+                    "id": str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{sid}_effect_vignette")),
+                    "effect": {
+                        "type": "gpu-effect",
+                        "gpuEffectType": "gpu-vignette",
+                        "params": {
+                            "amount": round(rng_scene.uniform(0.22, 0.34), 2),
+                            "size": 0.52,
+                            "softness": 0.55,
+                            "roundness": 1,
+                        },
+                    },
+                    "enabled": True,
+                })
 
         adjustment_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{sid}_adjustment"))
         items.append({
@@ -4426,10 +3969,10 @@ def _build_scene_adjustments(project_id, scenes, items):
             "trackId": "track_fg_1",
             "from": start_f,
             "durationInFrames": dur_f,
-            "label": style.upper().replace("_", " "),
+            "label": style_label,
             "effects": effects_list,
             "effectOpacity": 1,
-            "originId": adjustment_id
+            "originId": adjustment_id,
         })
 
 
@@ -4439,33 +3982,24 @@ def build_freecut_bundle(project_dir):
     if not os.path.exists(storyboard_file):
         print(f"  Erro: storyboard.json não encontrado em: {project_dir}")
         return False
-        
+
     with open(storyboard_file, "r", encoding="utf-8") as f:
         storyboard = json.load(f)
-        
+
     words = []
     words_file = os.path.join(project_dir, "words.json")
     if os.path.exists(words_file):
         with open(words_file, "r", encoding="utf-8") as f:
             words = json.load(f)
-            
-    # Render kinetic typography using HyperFrames first
+
     render_hyperframes_subtitles(project_dir, storyboard, words)
-        
+
     scenes = storyboard.get("scenes", [])
     total_dur_ms = storyboard.get("total_duration_ms", 0)
     if not total_dur_ms and scenes:
         total_dur_ms = max(s.get("end_ms", 0) for s in scenes)
     title = storyboard.get("title", "freecut-project")
-    
-    has_cyrillic = any(re.search(r"[\u0400-\u04FF]", s.get("narration", "")) for s in scenes)
-    if has_cyrillic:
-        allowed_fonts = ["Roboto", "Open Sans", "Inter", "Montserrat"]
-    else:
-        allowed_fonts = ["Roboto", "Open Sans", "Google Sans", "Noto Sans JP", "Inter", "Montserrat"]
-    chosen_font = random.choice(allowed_fonts)
-    print(f"  [Font] Fonte selecionada aleatoriamente para o vídeo: {chosen_font}")
-    
+
     audio_files = glob.glob(os.path.join(project_dir, "*.mp3")) + glob.glob(os.path.join(project_dir, "*.wav"))
     if not audio_files:
         print("  Erro: Nenhum arquivo de áudio (.wav ou .mp3) encontrado na raiz do projeto")
@@ -4473,23 +4007,31 @@ def build_freecut_bundle(project_dir):
     audio_file = audio_files[0]
     raw_audio_dur = get_audio_duration_ms(audio_file) or total_dur_ms
     audio_dur_ms = min(raw_audio_dur, total_dur_ms) if total_dur_ms > 0 else raw_audio_dur
-    
-    safe_title = "".join(c if c.isalnum() or c in "_- " else "" for c in title).replace(" ", "_")[:40]
+
+    safe_title = "".join(c if c.isalnum() or c in "_- " else "" for c in title).replace(" ", "_")[:40] or "freecut_project"
     project_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, safe_title))
-    # 0. Sorteia o estilo de câmera global para o projeto (Editor virtual)
-    rng_proj = random.Random(project_id)
-    project_styles = ["cinematic_retro", "vhs_leak", "vintage_sepia", "noir_bw", "modern_grain", "trigger_wave", "documentary_clean"]
-    global_style = rng_proj.choice(project_styles)
-    print(f"  [Style] Estilo de câmera global selecionado para o projeto: {global_style}")
-    
+
+    sample_narration = " ".join(s.get("narration", "") for s in scenes[:12])
+    palette_key, palette = editorial_engine.select_project_typography_palette(
+        project_seed=project_id,
+        title=title,
+        mode=storyboard.get("mode", "default"),
+        universe=storyboard.get("universe", ""),
+        sample_text=sample_narration,
+        explicit_theme=storyboard.get("font_theme", ""),
+    )
+    chosen_font = palette["body_font"]
+    explicit_style = str(storyboard.get("global_style", "") or "")
+    print(f"  [Typography] Paleta editorial selecionada: {palette['name']} ({palette_key} -> body='{palette['body_font']}', display='{palette['display_font']}')")
+
     items = []
     all_keyframes = []
     manifest_media = []
     media_files_to_zip = []
     seen_media_ids = set()
     media_id_to_filepath = {}
-    
-    def add_media(filepath):
+
+    def add_media(filepath, override_duration_s=None):
         sha256 = compute_sha256(filepath)
         media_id = str(uuid.uuid5(uuid.NAMESPACE_OID, sha256))
         media_id_to_filepath[media_id] = filepath
@@ -4498,12 +4040,12 @@ def build_freecut_bundle(project_dir):
         seen_media_ids.add(media_id)
         rel_path = f"media/{os.path.basename(filepath)}"
         mime = detect_mime(filepath)
-        
+
         w, h = CANVAS_W, CANVAS_H
         duration = 0.0
         codec = "unknown"
         fps = FPS
-        
+
         if mime.startswith("video/"):
             meta = get_video_metadata(filepath)
             w = meta["width"]
@@ -4514,8 +4056,11 @@ def build_freecut_bundle(project_dir):
         elif mime.startswith("audio/"):
             w = 0
             h = 0
-            dur_ms = get_audio_duration_ms(filepath)
-            duration = (dur_ms / 1000.0) if dur_ms else 1.0
+            if override_duration_s is not None and override_duration_s > 0:
+                duration = float(override_duration_s)
+            else:
+                dur_ms = get_audio_duration_ms(filepath)
+                duration = (dur_ms / 1000.0) if dur_ms else 1.0
             codec = "mp3" if filepath.lower().endswith(".mp3") else "wav"
             fps = FPS
         else:
@@ -4524,7 +4069,7 @@ def build_freecut_bundle(project_dir):
                     w, h = img.size
             except Exception:
                 pass
-            
+
         manifest_media.append({
             "originalId": media_id,
             "relativePath": rel_path,
@@ -4533,276 +4078,386 @@ def build_freecut_bundle(project_dir):
             "sha256": sha256,
             "mimeType": mime,
             "metadata": {
-                "duration": duration, "width": w, "height": h, "fps": fps,
-                "codec": codec, "bitrate": 0
-            }
+                "duration": duration,
+                "width": w,
+                "height": h,
+                "fps": fps,
+                "codec": codec,
+                "bitrate": 0,
+            },
         })
         media_files_to_zip.append((filepath, rel_path))
         return media_id
 
-    # 1. Add audio media and item
-    audio_sha256 = compute_sha256(audio_file)
-    audio_media_id = str(uuid.uuid5(uuid.NAMESPACE_OID, audio_sha256))
-    audio_rel = f"media/{os.path.basename(audio_file)}"
-    manifest_media.append({
-        "originalId": audio_media_id,
-        "relativePath": audio_rel,
-        "fileName": os.path.basename(audio_file),
-        "fileSize": os.path.getsize(audio_file),
-        "sha256": audio_sha256,
-        "mimeType": detect_mime(audio_file),
-        "metadata": {
-            "duration": audio_dur_ms / 1000.0,
-            "width": 0, "height": 0, "fps": FPS,
-            "codec": "unknown", "bitrate": 0
-        }
-    })
-    media_files_to_zip.append((audio_file, audio_rel))
-    
+    # 1. Register narration audio via add_media and append Schema v15 frame-unit audio item
+    audio_media_id = add_media(audio_file, override_duration_s=audio_dur_ms / 1000.0)
+    audio_dur_f = max(2, ms_to_frames(audio_dur_ms))
     audio_item_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{project_id}_audio"))
     items.append({
-        "id": audio_item_id, "trackId": "track_audio", "from": 0,
-        "durationInFrames": ms_to_frames(audio_dur_ms),
-        "label": os.path.basename(audio_file), "type": "audio",
+        "id": audio_item_id,
+        "trackId": "track_audio",
+        "from": 0,
+        "durationInFrames": audio_dur_f,
+        "label": os.path.basename(audio_file),
+        "type": "audio",
         "mediaRef": audio_media_id,
-        "sourceStart": 0, "sourceEnd": audio_dur_ms / 1000.0,
-        "sourceDuration": audio_dur_ms / 1000.0, "volume": 1.0,
-        "originId": audio_item_id
+        "sourceStart": 0,
+        "sourceEnd": audio_dur_f,
+        "sourceDuration": audio_dur_f,
+        "sourceFps": FPS,
+        "volume": 0,
+        "originId": audio_item_id,
     })
-    
-    # 2. Add scene items and subtitles
+
+    # 2. Add scene items and subtitles using cohesive typography palette
+    scene_by_anchor_id = {}
     for scene in scenes:
-        _build_scene_items(project_dir, scene, items, all_keyframes, add_media, global_style=global_style)
-        _build_subtitles(project_dir, scene, items, all_keyframes, add_media, font_family=chosen_font)
-        
-    # 2.1 Add PT-BR subtitles if available (centered in the middle of the screen across the entire video)
-    has_ptbr = _build_ptbr_subtitles(project_dir, scenes, items, all_keyframes, font_family="Inter")
-        
-    # 3. Add scene transitions between consecutive visual items on track_anchor
+        sid = scene["id"]
+        scene_by_anchor_id[str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{sid}_anchor"))] = scene
+        _build_scene_items(
+            project_dir,
+            scene,
+            items,
+            all_keyframes,
+            add_media,
+            global_style=explicit_style or "editorial_film",
+            palette=palette,
+        )
+        _build_subtitles(
+            project_dir,
+            scene,
+            items,
+            all_keyframes,
+            add_media,
+            font_family=chosen_font,
+            palette=palette,
+        )
+
+    # 2.1 Add PT-BR guide subtitles if available
+    has_ptbr = _build_ptbr_subtitles(project_dir, scenes, items, all_keyframes, font_family=chosen_font)
+
+    # 3. Add tasteful manual-feel transitions between consecutive full_screen / text_only clips on track_anchor
     transitions_list = []
-    anchor_items = [item for item in items if item.get("trackId") == "track_anchor" and item.get("type") in ["video", "image", "lottie"]]
+    anchor_items = [
+        item for item in items
+        if item.get("trackId") == "track_anchor" and item.get("type") in ["video", "image", "lottie"]
+    ]
     anchor_items.sort(key=lambda x: x["from"])
-    
+
     import random as prng
     rng = prng.Random(project_id)
-    
-    presets = [
-        "dissolve", "additiveDissolve", "blurDissolve", "wipe", "slide", 
-        "glitch", "pixelate", "liquidDistort", "lensWarpZoom", "filmGateSlip"
-    ]
-    directions = ["from-left", "from-right", "from-top", "from-bottom"]
-    
+    prev_trans_preset = None
+
     for i in range(len(anchor_items) - 1):
         left_item = anchor_items[i]
-        right_item = anchor_items[i+1]
-        
-        # Check if either item is a card or Lottie
+        right_item = anchor_items[i + 1]
+
+        # Ensure clips are strictly adjacent before attaching a crossfade transition
+        if left_item["from"] + left_item["durationInFrames"] != right_item["from"]:
+            continue
+
         left_label = left_item.get("label", "").lower()
         right_label = right_item.get("label", "").lower()
         is_card = "card" in left_label or "card" in right_label or "lottie" in left_label or "lottie" in right_label
-        
-        # Enable native transitions between all consecutive visual items on track_anchor EXCEPT when cards are involved
-        if True:
-            if is_card:
-                continue # Skip transition, do a clean cut to allow custom entrance keyframe to run!
-                
-            preset = rng.choice(presets)
-            duration_frames = rng.randint(14, 18) # 0.45s to 0.60s at 30 FPS
-            
-            trans = {
-                "id": str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{project_id}_trans_{i}")),
-                "leftClipId": left_item["id"],
-                "rightClipId": right_item["id"],
-                "trackId": "track_anchor",
-                "type": "crossfade",
-                "durationInFrames": duration_frames,
-                "presentation": preset,
-                "timing": "linear",
-                "alignment": 0.5
-            }
-            
-            if preset in ["wipe", "slide"]:
-                trans["direction"] = rng.choice(directions)
-                
-            transitions_list.append(trans)
+        if is_card:
+            prev_trans_preset = None
+            continue
 
+        right_scene = scene_by_anchor_id.get(right_item["id"], {})
+        scene_hint = str(right_scene.get("transition") or "")
+        choice = editorial_engine.select_editorial_transition(
+            left_label=left_label,
+            right_label=right_label,
+            scene_hint=scene_hint,
+            prev_preset=prev_trans_preset,
+            rng=rng,
+        )
+        if not choice:
+            prev_trans_preset = None
+            continue
 
-    # 4. Add scene-specific adjustment layers (randomly selected 10% to 40% of scenes)
-    _build_scene_adjustments(project_id, scenes, items)
-        
-    # safe_title is already computed at the beginning of the function
+        preset, desired_dur_f, direction = choice
+        max_by_clip = min(left_item["durationInFrames"], right_item["durationInFrames"]) // 2 - 1
+        max_allowed = max_by_clip
+
+        # Respect video source handles so FreeCut never drops handle-starved video transitions
+        if left_item.get("type") == "video":
+            left_tail = max(0, int(left_item.get("sourceDuration", 0)) - int(left_item.get("sourceEnd", 0)))
+            max_allowed = min(max_allowed, left_tail * 2)
+        if right_item.get("type") == "video":
+            right_head = max(0, int(right_item.get("sourceStart", 0)))
+            max_allowed = min(max_allowed, right_head * 2)
+
+        if max_allowed < 6:
+            prev_trans_preset = None
+            continue
+
+        duration_frames = max(6, min(desired_dur_f, max_allowed))
+        prev_trans_preset = preset
+
+        trans = {
+            "id": str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{project_id}_trans_{i}")),
+            "leftClipId": left_item["id"],
+            "rightClipId": right_item["id"],
+            "trackId": "track_anchor",
+            "type": "crossfade",
+            "durationInFrames": duration_frames,
+            "presentation": preset,
+            "timing": "cubic-bezier" if preset in ("slide", "wipe", "filmGateSlip", "smoothCut") else "linear",
+            "alignment": 0.5,
+        }
+        if trans["timing"] == "cubic-bezier":
+            trans["bezierPoints"] = {"x1": 0.25, "y1": 0.1, "x2": 0.25, "y2": 1.0}
+        if direction:
+            trans["direction"] = direction
+
+        transitions_list.append(trans)
+
+    # 4. Add LUT color grading + micro-grain adjustment layers
+    _build_scene_adjustments(project_id, scenes, items, palette=palette, explicit_style=explicit_style)
+
+    # 5. Prune unused empty foreground/background tracks so the timeline opens fast and clutter-free
+    raw_tracks = (
+        [
+            {
+                "id": "track_sub_ptbr",
+                "name": "Legenda PT-BR (Guia de Sincronia)",
+                "kind": "video",
+                "height": 100,
+                "locked": False,
+                "visible": True,
+                "muted": False,
+                "solo": False,
+                "order": 0,
+                "syncLock": True,
+                "volume": 0,
+            },
+            {
+                "id": "track_text",
+                "name": "Legenda Original",
+                "kind": "video",
+                "height": 100,
+                "locked": False,
+                "visible": True,
+                "muted": False,
+                "solo": False,
+                "order": 1,
+                "syncLock": True,
+                "volume": 0,
+            },
+        ]
+        + [{**tr, "order": tr["order"] + 1} for tr in TRACKS[1:]]
+    ) if has_ptbr else [dict(tr) for tr in TRACKS]
+
+    used_track_ids = {it.get("trackId") for it in items}
+    core_keep_ids = {"track_text", "track_anchor", "track_sfx", "track_audio"}
+    if has_ptbr:
+        core_keep_ids.add("track_sub_ptbr")
+
+    pruned_tracks = []
+    for tr in raw_tracks:
+        tid = tr["id"]
+        if tid in core_keep_ids or tid in used_track_ids:
+            tr_copy = dict(tr)
+            tr_copy["order"] = len(pruned_tracks)
+            pruned_tracks.append(tr_copy)
+
+    now_ms = int(time.time() * 1000)
     output_zip = os.path.join(project_dir, f"{safe_title}.freecut.zip")
-    
+
+    # Generate cover thumbnail bytes from first visual media asset
+    first_visual_path = None
+    first_visual_mime = ""
+    for entry in manifest_media:
+        m_mime = entry.get("mimeType", "")
+        if m_mime.startswith(("image/", "video/")):
+            cand_path = media_id_to_filepath.get(entry["originalId"])
+            if cand_path and os.path.isfile(cand_path) and not cand_path.endswith("_bg.png"):
+                first_visual_path = cand_path
+                first_visual_mime = m_mime
+                break
+    cover_bytes = editorial_engine.generate_project_cover_bytes(first_visual_path, first_visual_mime)
+
     project_json = {
         "id": project_id,
         "name": safe_title,
-        "description": "Generated by FreeCut v3 Pipeline",
-        "createdAt": int(time.time() * 1000),
-        "updatedAt": int(time.time() * 1000),
-        "duration": audio_dur_ms / 1000.0,
+        "description": f"Generated by FreeCut v3 Editorial Pipeline ({palette['name']})",
+        "createdAt": now_ms,
+        "updatedAt": now_ms,
+        "duration": round(audio_dur_ms / 1000.0, 3),
         "metadata": {
-            "width": CANVAS_W, "height": CANVAS_H,
-            "fps": FPS, "backgroundColor": "#000000"
+            "width": CANVAS_W,
+            "height": CANVAS_H,
+            "fps": FPS,
+            "backgroundColor": "#000000",
         },
         "timeline": {
-            "tracks": (
-                [
-                    {
-                        "id": "track_sub_ptbr",
-                        "name": "Legenda PT-BR (Guia de Sincronia)",
-                        "kind": "video",
-                        "height": 100,
-                        "locked": False,
-                        "visible": True,
-                        "muted": False,
-                        "solo": False,
-                        "order": 0,
-                        "syncLock": True,
-                        "volume": 0
-                    },
-                    {
-                        "id": "track_text",
-                        "name": "Legenda Original (Russo)",
-                        "kind": "video",
-                        "height": 100,
-                        "locked": False,
-                        "visible": True,
-                        "muted": False,
-                        "solo": False,
-                        "order": 1,
-                        "syncLock": True,
-                        "volume": 0
-                    }
-                ] + [
-                    {**tr, "order": tr["order"] + 1}
-                    for tr in TRACKS[1:]
-                ]
-            ) if has_ptbr else TRACKS,
+            "tracks": pruned_tracks,
             "items": items,
             "transitions": transitions_list,
-            "keyframes": all_keyframes
+            "keyframes": all_keyframes,
+            "masterBusDb": 0,
+            "currentFrame": 0,
+            "zoomLevel": 1,
+            "scrollPosition": 0,
         },
-        "schemaVersion": 15
+        "schemaVersion": 15,
     }
-    
+
     manifest = {
         "version": "1.0",
-        "createdAt": int(time.time() * 1000),
+        "createdAt": now_ms,
         "editorVersion": "1.0.0",
         "projectId": project_id,
         "projectName": safe_title,
         "media": manifest_media,
-        "checksum": ""
+        "checksum": "",
     }
-    
+    if cover_bytes:
+        manifest["thumbnail"] = "cover.jpg"
+
     manifest["checksum"] = hashlib.sha256(
-        json.dumps(manifest, separators=(',', ':'), ensure_ascii=False).encode('utf-8')
+        json.dumps(manifest, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
     ).hexdigest()
-    
-    # Write final zip bundle
-    with zipfile.ZipFile(output_zip, 'w', zipfile.ZIP_DEFLATED) as zf:
-        # Write project.json and manifest.json
+
+    with zipfile.ZipFile(output_zip, "w", zipfile.ZIP_DEFLATED) as zf:
         zf.writestr("project.json", json.dumps(project_json, indent=2, ensure_ascii=False))
         zf.writestr("manifest.json", json.dumps(manifest, indent=2, ensure_ascii=False))
-        
-        # Write media files
+        if cover_bytes:
+            zf.writestr("cover.jpg", cover_bytes)
         for src_path, zip_rel in media_files_to_zip:
             zf.write(src_path, zip_rel)
-            
+
     print(f"  [SUCCESS] Bundle compilado com sucesso em: {output_zip}")
-    
-    # Compile the freecut_workspace folder directly openable by the editor
+
+    # 6. Compile instant-load Workspace v2 folder (with pre-warmed filmstrips, waveforms & thumbnails)
     workspace_dir = os.path.join(project_dir, "freecut_workspace")
     if os.path.exists(workspace_dir):
         shutil.rmtree(workspace_dir, ignore_errors=True)
-        
+
     projects_dir = os.path.join(workspace_dir, "projects", project_id)
     os.makedirs(projects_dir, exist_ok=True)
-    
+
     with open(os.path.join(workspace_dir, ".freecut-workspace.json"), "w", encoding="utf-8") as f:
-        json.dump({"schemaVersion": "2.0", "createdAt": int(time.time() * 1000)}, f, ensure_ascii=False, indent=2)
-        
+        json.dump({"schemaVersion": "2.0", "createdAt": now_ms}, f, ensure_ascii=False, indent=2)
+
     index = {
         "version": "1.0",
-        "updatedAt": int(time.time() * 1000),
-        "projects": [{"id": project_id, "name": safe_title, "updatedAt": int(time.time() * 1000)}]
+        "updatedAt": now_ms,
+        "projects": [{"id": project_id, "name": safe_title, "updatedAt": now_ms}],
     }
     with open(os.path.join(workspace_dir, "index.json"), "w", encoding="utf-8") as f:
         json.dump(index, f, ensure_ascii=False, indent=2)
-        
-    # project.json inside workspace uses mediaId instead of mediaRef
-    ws_items = []
-    for item in items:
-        ws_item = dict(item)
-        if "mediaRef" in ws_item:
-            ws_item["mediaId"] = ws_item.pop("mediaRef")
-        ws_items.append(ws_item)
-        
-    ws_project = dict(project_json)
-    ws_project["timeline"]["items"] = ws_items
-    with open(os.path.join(projects_dir, "project.json"), "w", encoding="utf-8") as f:
-        json.dump(ws_project, f, ensure_ascii=False, indent=2)
-        
-    # Copy media assets into workspace/media/{id}/{fileName}
+
+    # Copy media files into workspace/media/{id}/{fileName} first so caches can also inspect them
     for entry in manifest_media:
         media_id = entry["originalId"]
         media_dir_path = os.path.join(workspace_dir, "media", media_id)
         os.makedirs(media_dir_path, exist_ok=True)
-        
-        # metadata.json
+        src_file = media_id_to_filepath.get(media_id)
+        dest_file = os.path.join(media_dir_path, entry["fileName"])
+        if src_file and os.path.isfile(src_file):
+            shutil.copy2(src_file, dest_file)
+        else:
+            for local_path, _ in media_files_to_zip:
+                if os.path.basename(local_path) == entry["fileName"]:
+                    shutil.copy2(local_path, dest_file)
+                    media_id_to_filepath[media_id] = dest_file
+                    break
+
+    t0_cache = time.time()
+    thumb_map = editorial_engine.prewarm_workspace_media_caches(
+        workspace_dir=workspace_dir,
+        manifest_media=manifest_media,
+        media_id_to_filepath=media_id_to_filepath,
+    )
+    print(f"  [FastOpen Cache] Filmstrips 1fps, Waveforms WFORM v1 e Thumbnails pré-gerados em {time.time() - t0_cache:.2f}s")
+
+    for entry in manifest_media:
+        media_id = entry["originalId"]
+        mime = entry["mimeType"]
+        media_dir_path = os.path.join(workspace_dir, "media", media_id)
+        src_file = media_id_to_filepath.get(media_id) or os.path.join(media_dir_path, entry["fileName"])
+        mtime_ms = int(os.path.getmtime(src_file) * 1000) if os.path.isfile(src_file) else now_ms
+
         meta = {
-            "id": media_id, "storageType": "workspace",
-            "fileName": entry["fileName"], "fileSize": entry["fileSize"],
-            "mimeType": entry["mimeType"], "contentHash": entry["sha256"],
+            "id": media_id,
+            "storageType": "workspace",
+            "fileName": entry["fileName"],
+            "fileSize": entry["fileSize"],
+            "fileLastModified": mtime_ms,
+            "mimeType": mime,
+            "contentHash": entry["sha256"],
             "duration": entry["metadata"]["duration"],
-            "width": entry["metadata"]["width"], "height": entry["metadata"]["height"],
-            "fps": entry["metadata"]["fps"], "codec": entry["metadata"]["codec"], "bitrate": 0,
-            "tags": [], "createdAt": int(time.time() * 1000), "updatedAt": int(time.time() * 1000)
+            "width": entry["metadata"]["width"],
+            "height": entry["metadata"]["height"],
+            "fps": entry["metadata"]["fps"],
+            "codec": entry["metadata"]["codec"],
+            "bitrate": 0,
+            "tags": [],
+            "createdAt": now_ms,
+            "updatedAt": now_ms,
         }
+        if thumb_map.get(media_id):
+            meta["thumbnailId"] = media_id
+        if mime.startswith("video/"):
+            # Omit audioCodec on silent B-roll videos so FreeCut skips waveform worker decode!
+            meta["videoCodecSupported"] = True
+        elif mime.startswith("audio/"):
+            meta["audioCodecSupported"] = True
+
         with open(os.path.join(media_dir_path, "metadata.json"), "w", encoding="utf-8") as f:
             json.dump(meta, f, ensure_ascii=False, indent=2)
-            
-        src_file = media_id_to_filepath.get(media_id)
-        if src_file and os.path.isfile(src_file):
-            shutil.copy2(src_file, os.path.join(media_dir_path, entry["fileName"]))
-        else:
-            for local_path, rel_path in media_files_to_zip:
-                if os.path.basename(local_path) == entry["fileName"]:
-                    shutil.copy2(local_path, os.path.join(media_dir_path, entry["fileName"]))
-                    break
-                
-    # media-links.json
+
+    # Deep-copy project_json for workspace so .freecut.zip keeps mediaRef while workspace uses mediaId
+    ws_project = copy.deepcopy(project_json)
+    ws_items = []
+    for item in ws_project["timeline"]["items"]:
+        if "mediaRef" in item:
+            item["mediaId"] = item.pop("mediaRef")
+        ws_items.append(item)
+    ws_project["timeline"]["items"] = ws_items
+
+    if cover_bytes:
+        with open(os.path.join(projects_dir, "thumbnail.jpg"), "wb") as tf:
+            tf.write(cover_bytes)
+        ws_project["thumbnailId"] = f"project:{project_id}:cover"
+
+    with open(os.path.join(projects_dir, "project.json"), "w", encoding="utf-8") as f:
+        json.dump(ws_project, f, ensure_ascii=False, indent=2)
+
     media_links = {
         "version": "1.0",
-        "mediaIds": [{"id": entry["originalId"], "addedAt": int(time.time() * 1000)} for entry in manifest_media]
+        "mediaIds": [{"id": entry["originalId"], "addedAt": now_ms} for entry in manifest_media],
     }
     with open(os.path.join(projects_dir, "media-links.json"), "w", encoding="utf-8") as f:
         json.dump(media_links, f, ensure_ascii=False, indent=2)
-        
-    print(f"  [OK] Workspace compilado com sucesso em: {workspace_dir}")
+
+    print(f"  [OK] Workspace v2 instant-load compilado com sucesso em: {workspace_dir}")
     return True
+
 
 # ── Main Entry Point ──────────────────────────────────────────
 def main():
     parser = argparse.ArgumentParser(description="FreeCut v3 Video Automation Tool")
     sub = parser.add_subparsers(dest="command", required=True)
-    
+
     rebuild_cmd = sub.add_parser("rebuild", help="Aplica os novos arquétipos e legendas fatiadas no storyboard.")
     rebuild_cmd.add_argument("project_dir", help="Caminho para o diretório do projeto.")
-    
+
     download_cmd = sub.add_parser("download", help="Faz download das mídias das APIs (Pexels/Pixabay) ou scrapers.")
     download_cmd.add_argument("project_dir", help="Caminho para o diretório do projeto.")
-    
+
     build_cmd = sub.add_parser("build", help="Processa imagens com Pillow e compila o bundle .freecut.zip")
     build_cmd.add_argument("project_dir", help="Caminho para o diretório do projeto.")
-    
+
     run_cmd = sub.add_parser("run-project", help="Executa todo o pipeline de ponta a ponta.")
     run_cmd.add_argument("project_dir", help="Caminho para o diretório do projeto.")
-    
+
     args = parser.parse_args()
     project_dir = os.path.abspath(args.project_dir)
     load_env(project_dir)
-    
+
     if args.command == "rebuild":
         rebuild_storyboard(project_dir)
     elif args.command == "download":
@@ -4818,15 +4473,10 @@ def main():
             sys.exit(1)
         if not process_images_pipeline(project_dir):
             sys.exit(1)
-        # Render transparent kinetic titles / cards if configured
-        with open(os.path.join(project_dir, "storyboard.json"), "r", encoding="utf-8") as f:
-            sb_data = json.load(f)
-        with open(os.path.join(project_dir, "words.json"), "r", encoding="utf-8") as f:
-            w_data = json.load(f)
-        render_hyperframes_subtitles(project_dir, sb_data, w_data)
         if not build_freecut_bundle(project_dir):
             sys.exit(1)
         print("=== Pipeline v3 Finalizado com Sucesso ===")
+
 
 if __name__ == "__main__":
     main()

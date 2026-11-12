@@ -390,38 +390,39 @@ def classify_scene_archetype(
     is_action = any(k in text_lower for k in action_keywords)
     is_character = any(k in text_lower for k in character_keywords)
 
-    # Base Archetype Scoring
-    score_full_screen = 2.0 if is_action else 1.0
-    score_single_card = 2.5 if is_character else 1.5
-    score_split_slide = 3.0 if (is_data and duration_ms >= 4500) else 0.5
-    score_text_only = 2.5 if (is_hook and duration_ms <= 4500) else 0.2
-    score_lottie = 2.0 if ("lottie" in text_lower or (is_data and not is_action)) else 0.3
+    # Base Archetype Scoring (~70% full_screen, ~18% single_card, ~9% split_info_slide, ~3% text_only)
+    score_full_screen = 2.6 if is_action else 2.0
+    score_single_card = 2.2 if is_character else 1.2
+    score_split_slide = 2.6 if (is_data and duration_ms >= 4500) else 0.4
+    score_text_only = 2.4 if (is_hook and scene_idx > 0 and duration_ms <= 4500) else 0.1
 
     # Penalize if repeated in recent scenes (anti-monotony rule)
-    if len(prev_archetypes) >= 1 and prev_archetypes[-1] == "full_screen":
-        score_full_screen *= 0.4
     if len(prev_archetypes) >= 1 and prev_archetypes[-1] == "single_card":
-        score_single_card *= 0.6
+        score_single_card *= 0.35
     if len(prev_archetypes) >= 1 and prev_archetypes[-1] == "split_info_slide":
-        score_split_slide *= 0.2
+        score_split_slide *= 0.15
     if len(prev_archetypes) >= 2 and prev_archetypes[-1] == prev_archetypes[-2]:
         if prev_archetypes[-1] == "single_card":
-            score_single_card *= 0.2
+            score_single_card = 0.0
         elif prev_archetypes[-1] == "full_screen":
-            score_full_screen *= 0.1
+            score_full_screen *= 0.45
 
-    # Frequency Caps Check (Split info slide max 30%)
+    # Frequency Caps Check (Split info slide max 15%, Text only max 5%)
     split_count = sum(1 for a in prev_archetypes if a == "split_info_slide")
-    if total_scenes > 0 and (split_count / max(1, len(prev_archetypes))) >= 0.30:
+    if total_scenes > 0 and (split_count / max(1, total_scenes)) >= 0.15:
         score_split_slide = 0.0
+    text_only_count = sum(1 for a in prev_archetypes if a == "text_only")
+    if total_scenes > 0 and (text_only_count >= max(1, int(total_scenes * 0.05))):
+        score_text_only = 0.0
 
-    scores = {
+    scores: Dict[str, float] = {
         "full_screen": score_full_screen,
         "single_card": score_single_card,
         "split_info_slide": score_split_slide,
         "text_only": score_text_only,
-        "lottie": score_lottie
     }
+    if "lottie" in text_lower:
+        scores["lottie"] = 3.0
 
     # Select highest scoring layout
     selected_layout = max(scores, key=lambda k: scores[k])
@@ -472,14 +473,21 @@ def select_background_for_scene(
     narration: str,
     layout_style: str,
     global_style: str = "dynamic_cinematic",
-    universe: str = ""
-) -> Dict[str, Any]:
+    universe: str = "",
+    scene_idx: int = 0,
+) -> Optional[Dict[str, Any]]:
     """
-    Selects an appropriate background loop texture from the asset catalog
-    based on semantic context and visual universe.
+    Opt-in contextual background loop (~5-8% of scenes only, pure #000000 default).
     """
-    text_lower = f"{universe} {narration}".lower()
+    if layout_style in ("full_screen", "text_only"):
+        return None
 
+    rng = random.Random(f"bg_optin_{scene_idx}_{narration[:20]}")
+    if rng.random() > 0.25:
+        return None
+
+    text_lower = f"{universe} {narration}".lower()
+    category = None
     if any(w in text_lower for w in ["mapa", "geopolitica", "fronteira", "territorio", "map", "rota", "reino", "navegação"]):
         category = "topographic"
     elif any(w in text_lower for w in ["papel", "processo", "documento", "jornal", "dossie", "relatorio", "carta", "judicial", "autos"]):
@@ -488,27 +496,23 @@ def select_background_for_scene(
         category = "film_grain"
     elif any(w in text_lower for w in ["batalha", "combate", "guerra", "violencia", "destruicao", "grunge", "trevas", "ataque"]):
         category = "grunge"
-    elif any(w in text_lower for w in ["tecnologia", "digital", "rede", "cyber", "dados", "tech", "futuristic", "ferrari", "supercarro"]):
+    elif any(w in text_lower for w in ["tecnologia", "digital", "rede", "cyber", "dados", "tech", "futuristic"]):
         category = "particles_tech"
-    elif any(w in text_lower for w in ["blueprint", "grid", "coordenadas", "radar", "engenharia"]):
-        category = "grids"
-    elif any(w in text_lower for w in ["clean", "white", "claro", "corporativo", "editorial"]):
-        category = "bright_white"
-    else:
-        category = "dark_minimal"
+
+    if not category:
+        return None
 
     asset_filename = None
     if asset_catalog is not None:
-        bg_asset = asset_catalog.get_background(category=category, fallback=True)
+        bg_asset = asset_catalog.get_background(category=category, fallback=True, deterministic_seed=f"S{scene_idx:02d}_bg")
         if bg_asset:
             asset_filename = bg_asset.filename
 
     return {
+        "enabled": True,
         "source": "asset",
         "category": category,
         "asset_name": asset_filename or "10.mp4",
-        "blur": 8,
-        "opacity": 0.85
     }
 
 
@@ -520,31 +524,30 @@ def select_sfx_for_scene(
     prev_had_sfx: bool
 ) -> Optional[Dict[str, Any]]:
     """
-    Selects a synchronized transition SFX (Whoosh or Air-Woosh) ducked within
-    safe acoustic levels (0.35 to 0.45), preventing sonic clutter.
+    Selects causal transition SFX calibrated in dB (-21 dB to -31 dB).
+    Zero sound on frame 0 (scene_idx == 0) and zero sound on text_only cuts.
     """
-    # Prevent chaotic whooshes on rapid consecutive scenes (< 3.5s)
+    if scene_idx <= 0 or layout_style in ("text_only", "full_screen"):
+        return None
     if duration_ms < 3500 and prev_had_sfx:
         return None
 
-    if layout_style in ["single_card", "full_screen"]:
-        # Vigorous Whoosh for card snap entrance / camera cut
-        whooshes = ["Whoosh 1.mp3", "Whoosh 2.mp3", "Whoosh 7.mp3"]
-        asset_name = random.choice(whooshes)
-        volume = 0.42  # Calibrated ducking volume
+    rng = random.Random(f"sfx_{scene_idx}_{narration[:16]}")
+    if layout_style == "single_card":
+        choices = [("Whoosh 1.mp3", -23.5), ("Whoosh 2.mp3", -21.0), ("Whoosh 7.mp3", -30.5)]
+        asset_name, volume_db = rng.choice(choices)
         sfx_type = "whoosh"
     else:
-        # Soft Air-Woosh for info slides / tags
         air_wooshes = ["air-woosh-1.mp3", "air-woosh-2.mp3", "air-woosh-3.mp3", "air-woosh-4.mp3"]
-        asset_name = random.choice(air_wooshes)
-        volume = 0.35  # Calibrated ducking volume
+        asset_name = rng.choice(air_wooshes)
+        volume_db = -21.5
         sfx_type = "air_woosh"
 
     return {
         "enabled": True,
         "type": sfx_type,
         "asset": asset_name,
-        "volume": volume
+        "volume": volume_db,
     }
 
 
@@ -595,9 +598,9 @@ def formulate_scene_query(
     politician_ratio = politician_q_count / max(1, total_q)
 
     final_query = ""
-    source = "pexels" if layout_style == "full_screen" else "duckduckgo"
+    source = "pixabay" if layout_style == "full_screen" else "yandex"
     source_type = "video" if layout_style == "full_screen" else "image"
-    specific = True
+    specific = layout_style != "full_screen"
 
     # 4. Formulate Query Text
     if mode == "pop":
@@ -827,12 +830,13 @@ def direct_storyboard(
         )
         used_queries.append(media_obj["query"])
 
-        # 3. Select Multi-Layer Background Loop (track_bg)
+        # 3. Select Opt-In Contextual Background Loop (track_bg, ~5-8% max)
         bg_obj = select_background_for_scene(
             narration=narration,
             layout_style=layout_style,
             global_style=global_style,
-            universe=universe
+            universe=universe,
+            scene_idx=i - 1,
         )
 
         # 4. Select Synchronized Transition SFX (track_sfx)
@@ -852,6 +856,12 @@ def direct_storyboard(
             if info_card_obj:
                 info_card_count += 1
 
+        # ~20% visual breathing room without subtitles on contemplative full_screen scenes
+        rng_sub = random.Random(f"sub_breath_{sid}_{narration[:12]}")
+        show_subs = True
+        if layout_style == "full_screen" and i > 1 and rng_sub.random() < 0.20:
+            show_subs = False
+
         scene: Dict[str, Any] = {
             "id": sid,
             "start_ms": start_ms,
@@ -862,11 +872,16 @@ def direct_storyboard(
             "scale": arch["scale"],
             "transition": arch["transition"],
             "camera_motion": arch["camera_motion"],
-            "subtitles": True,
-            "background": bg_obj,
-            "media": media_obj
+            "subtitles": show_subs,
         }
+        if layout_style != "text_only":
+            scene["media"] = media_obj
+        else:
+            words_clean = [w for w in re.findall(r"[A-Za-zÀ-ÿ0-9]+", narration) if len(w) > 1]
+            scene["text_only_text"] = " ".join(words_clean[:4]).upper() if words_clean else narration[:32].upper()
 
+        if bg_obj:
+            scene["background"] = bg_obj
         if sfx_obj:
             scene["sfx"] = sfx_obj
         if info_card_obj:

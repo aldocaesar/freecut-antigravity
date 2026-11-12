@@ -42,7 +42,8 @@ Para rodar vídeos de 1 minuto a 1 hora de primeira sem travar o modelo (inclusi
 2. **PROIBIDO dar `read_file` no código-fonte dos scripts** (`pipeline_v3.py`, `asset_catalog.py`, etc.), salvo se um comando retornar `Traceback` real.
 3. **PROIBIDO dar `read_file` em `words.json` bruto** ou abrir dezenas de imagens avulsas na conversa principal. Leia **exclusivamente** o arquivo leve `projects/<nome>/slices.txt`.
 4. **PROIBIDO fazer loop manual de polling** repetido em `manage_task`.
-5. **Logs silenciosos**: Sempre redirecione a saída do compilador para arquivo (`> projects/<nome>/build.log 2>&1`) e leia apenas as últimas 25 linhas se precisar checar status.
+5. **PROIBIDO automatizar navegador** (Chrome DevTools) ou subir servidores web locais temporários.
+6. **Logs silenciosos**: Sempre redirecione a saída do compilador para arquivo (`> projects/<nome>/build.log 2>&1`) e leia apenas as últimas 25 linhas se precisar checar status.
 
 ---
 
@@ -87,7 +88,7 @@ Formato enxuto de cada item na lista JSON (você **não** escreve `start_ms` nem
 ```powershell
 python scripts/build_storyboard.py "projects/<nome_slug>" --title "<Titulo>"
 ```
-*(Para animes, filmes e séries, adicione `--mode pop --universe "<Nome da Obra>"`).*
+*(Opcional: `--mode pop --universe "<Obra>"` para animes/filmes/séries; `--font-theme <tema>` dentre `editorial_documentary`, `modern_grotesk`, `pop_cinema`, `investigative_press`, `literary_chronicle`, `clean_swiss`).*
 
 ### Passo 4 — Baixar Mídias, Compilar e Validar Pacote Final
 ```powershell
@@ -110,10 +111,11 @@ Entregue ao usuário os caminhos clicáveis da pasta `projects/<nome_slug>/freec
   - `[Obra] + [Personagem / Cena] + [still HD]` (ex: `"One Piece Luffy Gear 5 sky battle anime"`).
 - **Zero Repetição**: Cada cena deve ter uma `query` exclusiva e ligada apenas ao que é dito naquela cena.
 
-### Proporção Padrão de Layouts (Fundo Base `#000000`)
-1. `full_screen` (~70%): Tela cheia com Ken Burns automático (`"type": "video"` ou `"image"`).
-2. `single_card` (~15% a 20%): Card central flutuando sobre fundo `#000000`.
-3. `split_info_slide` (~10%): Divisão card + texto lateral (`"sub": true`).
-4. `text_only` (1 a 3 vezes no vídeo em viradas dramáticas): Tela 100% preta com frase curta de impacto em `"text_only_text"` (2 a 4 palavras, ex: `"O PONTO DE VIRADA"`).
-5. **Respiro de Legenda**: Deixe ~20% das cenas contemplativas em `full_screen` com `"sub": false`.
-6. **Proibido** repetir o mesmo `layout` (exceto `full_screen`) em mais de 2 cenas seguidas.
+### Proporção Padrão de Layouts & Pegada Manual (Fundo Base `#000000`)
+1. `full_screen` (~70%): Tela cheia com Ken Burns suave e LUT cinematográfico (`"type": "video"` ou `"image"`).
+2. `single_card` (~15% a 20%): Card central sobre `#000000` com **8 molduras artesanais variadas automaticamente** (ou defina `"frame_style"` opcional em `specs.json`: `polaroid_editorial`, `torn_paper_scrapbook`, `analog_film_35mm`, `chamfer_dossier`, `gallery_double_mat`, `offset_stacked_print`, `vintage_archival_stamp`, `cinema_glass_bevel`).
+3. `split_info_slide` (~10%): Divisão card artesanal + tipografia lateral com barra editorial (`"sub": true`).
+4. `text_only` (1 a 3 vezes no vídeo em viradas dramáticas): Tela 100% preta com título de impacto em `"text_only_text"` (2 a 4 palavras, ex: `"O PONTO DE VIRADA"`).
+5. **Texturas de Fundo Contextuais (Opt-in 5% a 8%)**: Em cenas pontuais de dossiê/história/mapa, pode incluir `"bg_category"` opcional (`paper`, `film_grain`, `grunge`, `topographic`, `particles_tech`).
+6. **Respiro de Legenda**: Deixe ~20% das cenas contemplativas em `full_screen` com `"sub": false`.
+7. **Proibido** repetir o mesmo `layout` (exceto `full_screen`) em mais de 2 cenas seguidas.
